@@ -54,3 +54,4 @@ htmlcov/
 *.pt
 *.onnx
 *.engine
+config.yaml
