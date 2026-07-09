@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 
@@ -11,6 +12,8 @@ from app.modules.yolo.camera_data import BoundingBoxItem, CameraDataStore
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
 
+logger = logging.getLogger(__name__)
+
 
 class YOLODetector:
     def __init__(self, model_path: str = "best.pt"):
@@ -22,9 +25,16 @@ class YOLODetector:
         self.model = YOLO(model_path)
         try:
             import torch
-            self.device = 0 if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                self.device = 0
+                gpu_name = torch.cuda.get_device_name(0)
+                logger.info("YOLO running on GPU: %s", gpu_name)
+            else:
+                self.device = "cpu"
+                logger.warning("YOLO running on CPU (CUDA not available)")
         except Exception:
             self.device = "cpu"
+            logger.warning("YOLO running on CPU (torch import failed)")
         self.model.to(self.device)
         self.class_names = self.model.names
         self.model_lock = threading.Lock()

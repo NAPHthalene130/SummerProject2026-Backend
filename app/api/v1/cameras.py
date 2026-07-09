@@ -2,7 +2,8 @@ from typing import List
 
 from fastapi import APIRouter
 
-from app.models.camera import CameraResponse
+from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
+from app.modules.yolo import CameraDataStore
 from app.utils.camera_manager import CameraManager
 
 cameras_router = APIRouter()
@@ -20,3 +21,15 @@ async def list_cameras():
         )
         for cam in cameras
     ]
+
+
+@cameras_router.get("/stats", response_model=CameraStatsResponse)
+async def get_camera_stats():
+    store = CameraDataStore()
+    items: list[CameraStatsItem] = []
+    for cam_id, data in store.get_all().items():
+        items.append(CameraStatsItem(
+            camera_id=cam_id,
+            total_vehicle_count=data.total_vehicle_count,
+        ))
+    return CameraStatsResponse(cameras=items)
