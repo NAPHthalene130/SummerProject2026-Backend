@@ -1,10 +1,15 @@
 import random
+import threading
 import time
 
 import cv2
 import numpy as np
+import supervision as sv
+from ultralytics import YOLO
 
 TRAFFIC_CLASSES = ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle"]
+LOST_BUFFER = 30
+
 COLORS = {
     "car": (56, 56, 255),
     "truck": (255, 144, 30),
@@ -16,33 +21,12 @@ COLORS = {
 
 
 class YOLODetector:
-<<<<<<< Updated upstream
-    def __init__(self, model_path: str = ""):
-=======
-    """
-    ═══════════════════════════════════════════════════════
-    视频流接收接口:
-      外部将视频帧传入 detect(frame, cam_id) 即可。v
-      每路摄像头独立追踪，cam_id 用于区分不同摄像头。
-    ═══════════════════════════════════════════════════════
-    处理结果传输接口:
-      - detect() 返回 annotated frame (绘制了框/轨迹/速度的帧)
-      - get_detections(cam_id) → dict: 最近一帧的检测结果 JSON
-      - get_all_detections() → dict: 所有摄像头的检测结果
-    ═══════════════════════════════════════════════════════
-    """
-
     def __init__(self, model_path: str = "best.pt"):
->>>>>>> Stashed changes
         self.model_path = model_path
         self._fps = 0.0
         self._frame_count = 0
         self._last_time = time.perf_counter()
 
-<<<<<<< Updated upstream
-    def detect(self, frame: np.ndarray) -> np.ndarray:
-=======
-        # YOLO 模型
         self.model = YOLO(model_path)
         try:
             import torch
@@ -53,34 +37,19 @@ class YOLODetector:
         self.class_names = self.model.names
         self.model_lock = threading.Lock()
 
-        # 跟踪器 & 轨迹 (按摄像头独立)
         self.trackers = {}
         self.trails = {}
         self.speed_displays = {}
         self.frame_counts = {}
-
-        # 存储最新检测结果供外部获取
         self._latest_detections = {}
 
-    # ── 公共接口 ────────────────────────────────────────
-
     def detect(self, frame: np.ndarray, cam_id: str = "default") -> np.ndarray:
-        """
-        视频流接收接口:
-          传入一帧 BGR 图像，返回绘制了检测框/轨迹/速度的帧。
-          cam_id 区分不同摄像头，追踪器按 cam_id 独立维护。
-        """
-        # 确保该摄像头有独立的追踪器
         if cam_id not in self.trackers:
-            self.trackers[cam_id] = sv.ByteTrack(
-                lost_track_buffer=LOST_BUFFER
-            )
+            self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
             self.trails[cam_id] = {}
             self.speed_displays[cam_id] = {}
             self.frame_counts[cam_id] = 0
 
-        # 缩放至推理尺寸
->>>>>>> Stashed changes
         h, w = frame.shape[:2]
 
         num_boxes = random.randint(0, 5)
