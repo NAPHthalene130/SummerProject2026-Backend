@@ -1,4 +1,3 @@
-import random
 import threading
 import time
 
@@ -7,17 +6,10 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
-TRAFFIC_CLASSES = ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle"]
-LOST_BUFFER = 30
+from app.modules.yolo.camera_data import BoundingBoxItem, CameraDataStore
 
-COLORS = {
-    "car": (56, 56, 255),
-    "truck": (255, 144, 30),
-    "bus": (255, 224, 32),
-    "pedestrian": (80, 200, 120),
-    "bicycle": (255, 105, 180),
-    "motorcycle": (128, 0, 128),
-}
+LOST_BUFFER = 30
+TRAIL_MAX_AGE = 30
 
 
 class YOLODetector:
@@ -37,39 +29,101 @@ class YOLODetector:
         self.class_names = self.model.names
         self.model_lock = threading.Lock()
 
-        self.trackers = {}
-        self.trails = {}
-        self.speed_displays = {}
-        self.frame_counts = {}
-        self._latest_detections = {}
+        self.trackers: dict[str, sv.ByteTrack] = {}
+        self.trails: dict[str, dict[int, list[tuple[float, float]]]] = {}
+        self.trail_age: dict[str, dict[int, int]] = {}
+        self.frame_counts: dict[str, int] = {}
+        self._latest_detections: dict[str, list[dict[str, object]]] = {}
+
+        self.box_annotator = sv.BoxAnnotator()
+        self.label_annotator = sv.LabelAnnotator()
+        self.trace_annotator = sv.TraceAnnotator()
 
     def detect(self, frame: np.ndarray, cam_id: str = "default") -> np.ndarray:
         if cam_id not in self.trackers:
             self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
             self.trails[cam_id] = {}
-            self.speed_displays[cam_id] = {}
             self.frame_counts[cam_id] = 0
 
-        h, w = frame.shape[:2]
+        self.frame_counts[cam_id] += 1
 
-        num_boxes = random.randint(0, 5)
-        for _ in range(num_boxes):
-            box_w = random.randint(int(w * 0.05), int(w * 0.25))
-            box_h = random.randint(int(h * 0.05), int(h * 0.25))
-            x1 = random.randint(0, w - box_w)
-            y1 = random.randint(0, h - box_h)
-            x2 = x1 + box_w
-            y2 = y1 + box_h
+        with self.model_lock:
+            results = self.model(frame, device=self.device, verbose=False)
 
-            cls_name = random.choice(TRAFFIC_CLASSES)
-            confidence = round(random.uniform(0.5, 0.99), 2)
-            color = COLORS[cls_name]
+        detections = sv.Detections.from_ultralytics(results[0])
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"{cls_name} {confidence:.2f}"
-            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(frame, (x1, y1 - th - baseline - 4), (x1 + tw, y1), color, -1)
-            cv2.putText(frame, label, (x1, y1 - baseline - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if len(detections) > 0:
+            detections = self.trackers[cam_id].update_with_detections(detections)
+        else:
+            detections.tracker_id = np.array([], dtype=int)
+
+        labels: list[str] = []
+        detection_list: list[dict[str, object]] = []
+        for i in range(len(detections)):
+            if detections.tracker_id is not None and i < len(detections.tracker_id):
+                track_id = int(detections.tracker_id[i])
+            else:
+                track_id = -1
+
+            class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
+            class_name = self.class_names.get(class_id, f"cls_{class_id}")
+            conf = float(detections.confidence[i]) if detections.confidence is not None else 0.0
+            xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
+
+            labels.append(f"#{track_id} {class_name} {conf:.2f}")
+
+            cx = (xyxy[0] + xyxy[2]) / 2
+            cy = (xyxy[1] + xyxy[3]) / 2
+            if track_id not in self.trails[cam_id]:
+                self.trails[cam_id][track_id] = []
+            self.trails[cam_id][track_id].append((cx, cy))
+            if len(self.trails[cam_id][track_id]) > 30:
+                self.trails[cam_id][track_id].pop(0)
+
+            self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
+
+            detection_list.append({
+                "track_id": track_id,
+                "class_name": class_name,
+                "confidence": conf,
+                "bbox": xyxy,
+            })
+        self._latest_detections[cam_id] = detection_list
+
+        CameraDataStore().update(
+            camera_id=cam_id,
+            total_vehicle_count=len(detection_list),
+            boxes=[
+                BoundingBoxItem(
+                    track_id=int(d["track_id"]),
+                    class_name=str(d["class_name"]),
+                    confidence=float(d["confidence"]),
+                    bbox=list(d["bbox"]),
+                )
+                for d in detection_list
+            ],
+        )
+
+        frame = self.box_annotator.annotate(scene=frame, detections=detections)
+        frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
+
+        current_frame = self.frame_counts[cam_id]
+        stale_ids: list[int] = []
+        for track_id in list(self.trails[cam_id].keys()):
+            age = self.trail_age.get(cam_id, {}).get(track_id, 0)
+            if current_frame - age > TRAIL_MAX_AGE:
+                stale_ids.append(track_id)
+                continue
+            trail = self.trails[cam_id][track_id]
+            if len(trail) < 2:
+                continue
+            for j in range(1, len(trail)):
+                pt1 = (int(trail[j - 1][0]), int(trail[j - 1][1]))
+                pt2 = (int(trail[j][0]), int(trail[j][1]))
+                cv2.line(frame, pt1, pt2, (0, 255, 255), 1)
+        for track_id in stale_ids:
+            del self.trails[cam_id][track_id]
+            self.trail_age.get(cam_id, {}).pop(track_id, None)
 
         self._frame_count += 1
         now = time.perf_counter()

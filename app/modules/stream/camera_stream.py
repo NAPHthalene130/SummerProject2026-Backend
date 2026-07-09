@@ -137,7 +137,7 @@ class CameraStream:
                     continue
                 raw = self._raw_frame.copy()
 
-            processed = self.yolo.detect(raw)
+            processed = self.yolo.detect(raw, cam_id=self.config.id)
             processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
 
             with self._lock:
