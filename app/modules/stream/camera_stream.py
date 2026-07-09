@@ -27,9 +27,14 @@ class CameraStream:
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
         self._use_test_frame = False
-        self._thread: Optional[threading.Thread] = None
         self._subscriber_count = 0
         self._frame_ready = threading.Event()
+
+        self._raw_frame: Optional[np.ndarray] = None
+        self._raw_lock = threading.Lock()
+        self._raw_ready = threading.Event()
+        self._cap_thread: Optional[threading.Thread] = None
+        self._det_thread: Optional[threading.Thread] = None
 
     @property
     def camera_id(self) -> str:
@@ -54,21 +59,32 @@ class CameraStream:
             return
         self._running = True
         self._frame_ready.clear()
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+        self._raw_ready.clear()
+
+        self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._cap_thread.start()
+
+        self._det_thread = threading.Thread(target=self._detection_loop, daemon=True)
+        self._det_thread.start()
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
+        self._raw_ready.set()
+        for thread in [self._cap_thread, self._det_thread]:
+            if thread is not None:
+                thread.join(timeout=5)
+        self._cap_thread = None
+        self._det_thread = None
         if self._cap is not None:
             self._cap.release()
             self._cap = None
         with self._lock:
             self._latest_frame = None
             self._latest_frame_id = -1
+        with self._raw_lock:
+            self._raw_frame = None
         self._frame_ready.clear()
+        self._raw_ready.clear()
 
     def _init_rtsp(self) -> bool:
         self._cap = cv2.VideoCapture(self.config.url, cv2.CAP_FFMPEG)
@@ -76,6 +92,61 @@ class CameraStream:
             return False
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return True
+
+    def _capture_loop(self) -> None:
+        if not self._init_rtsp():
+            self._use_test_frame = True
+
+        while self._running:
+            loop_start = time.perf_counter()
+
+            if self._use_test_frame:
+                frame = self._generate_test_frame()
+            else:
+                ret, frame = self._cap.read()
+                if not ret:
+                    self._cap.release()
+                    self._use_test_frame = True
+                    frame = self._generate_test_frame()
+
+            with self._raw_lock:
+                self._raw_frame = frame.copy()
+            self._raw_ready.set()
+
+            if not self._frame_ready.is_set():
+                self._frame_id += 1
+
+            elapsed = time.perf_counter() - loop_start
+            sleep_time = FRAME_INTERVAL - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _detection_loop(self) -> None:
+        first_detected = False
+        while self._running:
+            if not self._raw_ready.wait(timeout=1.0):
+                continue
+            self._raw_ready.clear()
+
+            with self._raw_lock:
+                if self._raw_frame is None:
+                    continue
+                raw = self._raw_frame.copy()
+
+            processed = self.yolo.detect(raw)
+            processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+
+            with self._lock:
+                self._latest_frame = processed_rgb
+                self._latest_frame_id = self._frame_id
+
+            if not first_detected:
+                first_detected = True
+                self._frame_ready.set()
 
     def _generate_test_frame(self) -> np.ndarray:
         global OBJ_CENTER_X
@@ -113,45 +184,6 @@ class CameraStream:
         )
 
         return frame
-
-    def _read_loop(self) -> None:
-        if not self._init_rtsp():
-            self._use_test_frame = True
-
-        while self._running:
-            loop_start = time.perf_counter()
-
-            if self._use_test_frame:
-                frame = self._generate_test_frame()
-            else:
-                ret, frame = self._cap.read()
-                if not ret:
-                    self._cap.release()
-                    self._use_test_frame = True
-                    frame = self._generate_test_frame()
-                    with self._lock:
-                        self._latest_frame = None
-
-            processed = self.yolo.detect(frame)
-            processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-
-            with self._lock:
-                self._latest_frame = processed_rgb
-                self._latest_frame_id = self._frame_id
-
-            self._frame_id += 1
-
-            if not self._frame_ready.is_set():
-                self._frame_ready.set()
-
-            elapsed = time.perf_counter() - loop_start
-            sleep_time = FRAME_INTERVAL - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
 
     def get_latest_frame(self) -> tuple[Optional[np.ndarray], int]:
         with self._lock:

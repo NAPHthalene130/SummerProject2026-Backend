@@ -1,8 +1,18 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel
+
+
+class CarInfo(BaseModel):
+    car_license: str
+    car_speed: float
+
+
+class CameraInfo(BaseModel):
+    car_info: List[CarInfo] = []
+    weather: str = ""
 
 
 class CameraConfig(BaseModel):
@@ -20,6 +30,7 @@ class CameraConfigList(BaseModel):
 class CameraManager:
     _instance: Optional["CameraManager"] = None
     _cameras: List[CameraConfig] = []
+    _camera_info_map: Dict[str, CameraInfo] = {}
 
     def __new__(cls) -> "CameraManager":
         if cls._instance is None:
@@ -34,6 +45,7 @@ class CameraManager:
 
         config_list = CameraConfigList.model_validate(data)
         self._cameras = config_list.cameras
+        self._camera_info_map = {}
 
     def reload(self) -> None:
         self._load()
@@ -46,3 +58,12 @@ class CameraManager:
             if cam.id == camera_id:
                 return cam
         return None
+
+    def get_camera_info(self, camera_id: str) -> Optional[CameraInfo]:
+        return self._camera_info_map.get(camera_id)
+
+    def update_camera_info(self, camera_id: str, camera_info: CameraInfo) -> None:
+        self._camera_info_map[camera_id] = camera_info
+
+    def get_all_camera_info(self) -> Dict[str, CameraInfo]:
+        return self._camera_info_map
