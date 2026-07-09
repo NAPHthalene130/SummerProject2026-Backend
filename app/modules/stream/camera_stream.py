@@ -87,10 +87,10 @@ class CameraStream:
         self._raw_ready.clear()
 
     def _init_rtsp(self) -> bool:
-        self._cap = cv2.VideoCapture(self.config.url, cv2.CAP_FFMPEG)
-        if not self._cap.isOpened():
+        cap = cv2.VideoCapture(self.config.url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
             return False
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._cap = cap
         return True
 
     def _capture_loop(self) -> None:

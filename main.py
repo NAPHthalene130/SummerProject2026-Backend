@@ -2,6 +2,9 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
 import av
 import uvicorn
 from fastapi import FastAPI
