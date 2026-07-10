@@ -7,7 +7,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
-from app.modules.yolo.camera_data import BoundingBoxItem, CameraDataStore
+from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30

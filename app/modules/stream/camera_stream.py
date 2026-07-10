@@ -190,3 +190,9 @@ class CameraStream:
             if self._latest_frame is None:
                 return None, -1
             return self._latest_frame.copy(), self._latest_frame_id
+
+    def get_raw_frame(self) -> tuple[Optional[np.ndarray], int]:
+        with self._raw_lock:
+            if self._raw_frame is None:
+                return None, -1
+            return self._raw_frame.copy(), self._frame_id

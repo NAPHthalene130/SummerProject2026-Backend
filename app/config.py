@@ -41,6 +41,12 @@ class DatabaseSettings(BaseModel):
         )
 
 
+class LLMSettings(BaseModel):
+    url: str = "https://api.openai.com/v1"
+    api_key: str = "your_api_key_here"
+    model_name: str = "your_model_name_here"
+
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "SummerProject2026"
     VERSION: str = "0.1.0"
@@ -54,9 +60,11 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: List[str] = ["*"]
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = {
+        "env_file": ".env",
+        "env_prefix": "SP2026_",
+        "case_sensitive": True,
+    }
 
 
 settings = Settings()
@@ -69,3 +77,12 @@ def get_database_settings() -> DatabaseSettings:
 
 
 database_settings = get_database_settings()
+
+
+@lru_cache
+def get_llm_settings() -> LLMSettings:
+    data = load_yaml_config().get("llm", {})
+    return LLMSettings.model_validate(data)
+
+
+llm_settings = get_llm_settings()

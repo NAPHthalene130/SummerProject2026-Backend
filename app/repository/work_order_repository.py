@@ -49,6 +49,40 @@ def split_images(value: Optional[str]) -> list[str]:
 
 class WorkOrderRepository:
     @staticmethod
+    def create_work_order(
+        camera_id: str,
+        camera_name: str,
+        incident_type: str,
+        description: str,
+        rank: int,
+        image_url: str = "",
+        scene_info: str = "",
+    ) -> Optional[WorkOrderItemResponse]:
+        event_id = f"evt_{camera_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        now = datetime.now()
+        with mysql_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO work_orders (
+                      event_id, camera_id, camera_name,
+                      work_order_type, work_order_describe, work_order_img_url,
+                      work_order_rank, work_order_status, work_order_is_solve,
+                      work_order_time, scene_info
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'unassigned', 0, %s, %s)
+                    """,
+                    (
+                        event_id, camera_id, camera_name,
+                        incident_type, description, image_url,
+                        rank, now, scene_info,
+                    ),
+                )
+                work_order_id = cursor.lastrowid
+        if work_order_id:
+            return WorkOrderRepository.get_work_order(str(work_order_id))
+        return None
+
+    @staticmethod
     def list_work_orders() -> list[WorkOrderItemResponse]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:

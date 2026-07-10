@@ -1,3 +1,16 @@
+database:
+  host: "127.0.0.1"
+  port: 3306
+  username: "root"
+  password: "123456"
+  name: "summer_project_2026"
+  charset: "utf8mb4"
+
+llm:
+  url: "https://api.openai.com/v1"
+  api_key: "your_api_key_here"
+  model_name: "your_model_name_here"
+
 cameras:
   - id: "cam-01"
     name: "桥面"

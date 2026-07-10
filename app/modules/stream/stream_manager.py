@@ -42,6 +42,9 @@ class StreamManager:
             if stream.subscriber_count == 0:
                 del self._streams[camera_id]
 
+    def get_all_streams(self) -> dict[str, "CameraStream"]:
+        return dict(self._streams)
+
     def stop_all(self) -> None:
         for stream in self._streams.values():
             stream.stop()
