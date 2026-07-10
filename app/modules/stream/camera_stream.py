@@ -115,6 +115,7 @@ class CameraStream:
             self._cap.release()
             self._cap = None
 
+
     def _generate_test_frame(self) -> np.ndarray:
         global OBJ_CENTER_X
         OBJ_CENTER_X = (OBJ_CENTER_X + 3) % (TEST_FRAME_W + 100)

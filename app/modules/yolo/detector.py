@@ -9,6 +9,8 @@ from ultralytics import YOLO
 
 from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 
+logger = logging.getLogger(__name__)
+
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
 
@@ -36,6 +38,11 @@ class YOLODetector:
             self.device = "cpu"
             logger.warning("YOLO running on CPU (torch import failed)")
         self.model.to(self.device)
+
+        if self.device != "cpu":
+            logger.info("YOLO detector using GPU (CUDA device %s)", self.device)
+        else:
+            logger.warning("YOLO detector using CPU -- install CUDA-enabled PyTorch for GPU acceleration")
         self.class_names = self.model.names
         self.model_lock = threading.Lock()
 

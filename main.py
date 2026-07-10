@@ -44,15 +44,36 @@ logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    cameras = CameraManager().get_all()
+    logger.info("Loaded %d cameras from config", len(cameras))
+    for cam in cameras:
+        logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
     if settings.ENABLE_STREAMING:
-        cameras = CameraManager().get_all()
-        logger.info("Loaded %d cameras from config", len(cameras))
         for cam in cameras:
-            logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
             StreamManager().subscribe(cam.id)
             logger.info("  Subscribed camera %s for analysis", cam.id)
     else:
         logger.info("Camera streaming disabled; running in API-only mode")
+
+    model_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "traffic_risk_lstm_weights.pth")
+    scaler_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "scaler_params.json")
+
+    if os.path.exists(model_path):
+        from app.modules.lstm.predictor import risk_predictor
+        try:
+            device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+            road_types = {cam.id: 0 for cam in cameras}
+            risk_predictor.initialize(
+                model_path,
+                scaler_path=scaler_path if os.path.exists(scaler_path) else None,
+                device=device,
+                camera_road_types=road_types,
+            )
+            logger.info("RiskPredictor loaded: %s on %s", model_path, device)
+        except Exception as e:
+            logger.warning("RiskPredictor init failed: %s", e)
+    else:
+        logger.info("RiskPredictor weights not found at %s, skipping init", model_path)
 
     traffic_analyst_enabled = (
         settings.ENABLE_TRAFFIC_ANALYST
