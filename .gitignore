@@ -36,6 +36,8 @@ data/uploads/*
 !data/uploads/.gitkeep
 data/models/*
 !data/models/.gitkeep
+app/data/orderImg/*
+!app/data/orderImg/.gitkeep
 
 # Logs
 *.log

@@ -1,6 +1,8 @@
 import logging
+import logging.handlers
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
@@ -9,15 +11,33 @@ import av
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
-from app.config import settings
+from app.config import llm_settings, settings
 from app.utils.camera_manager import CameraManager
+from app.modules.agent.traffic_analyst import TrafficAnalyst
+from app.modules.stream import StreamManager
 
 os.environ["AV_LOG_FORCE_COLOR"] = "0"
 av.logging.set_level(av.logging.FATAL)
 
-logging.basicConfig(level=logging.INFO)
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            _log_dir / "app.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
+)
 logger = logging.getLogger(__name__)
 logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
@@ -28,6 +48,12 @@ async def lifespan(application: FastAPI):
     logger.info("Loaded %d cameras from config", len(cameras))
     for cam in cameras:
         logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
+    if settings.ENABLE_STREAMING:
+        for cam in cameras:
+            StreamManager().subscribe(cam.id)
+            logger.info("  Subscribed camera %s for analysis", cam.id)
+    else:
+        logger.info("Camera streaming disabled; running in API-only mode")
 
     model_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "traffic_risk_lstm_weights.pth")
     scaler_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "scaler_params.json")
@@ -49,11 +75,21 @@ async def lifespan(application: FastAPI):
     else:
         logger.info("RiskPredictor weights not found at %s, skipping init", model_path)
 
+    traffic_analyst_enabled = (
+        settings.ENABLE_TRAFFIC_ANALYST
+        and llm_settings.api_key not in {"", "your_api_key_here"}
+    )
+    if traffic_analyst_enabled:
+        await TrafficAnalyst().start()
+    else:
+        logger.info("TrafficAnalyst disabled by configuration or missing API key")
+
     yield
-    from app.modules.stream import StreamManager
 
-    StreamManager().stop_all()
-
+    if traffic_analyst_enabled:
+        await TrafficAnalyst().stop()
+    if settings.ENABLE_STREAMING:
+        StreamManager().stop_all()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -69,6 +105,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_orderimg_dir = Path(__file__).resolve().parent / "app" / "data" / "orderImg"
+_orderimg_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/orderImg", StaticFiles(directory=str(_orderimg_dir)), name="orderImg")
 
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 

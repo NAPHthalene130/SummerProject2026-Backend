@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -9,54 +10,135 @@ from ultralytics import YOLO
 
 from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 
-logger = logging.getLogger(__name__)
-
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
+BATCH_SIZE = 8
 
 logger = logging.getLogger(__name__)
 
 
-class YOLODetector:
-    def __init__(self, model_path: str = "best.pt"):
-        self.model_path = model_path
-        self._fps = 0.0
-        self._frame_count = 0
-        self._last_time = time.perf_counter()
+class BatchDetector:
+    _instance: Optional["BatchDetector"] = None
+    _instance_lock = threading.Lock()
 
+    def __new__(cls, model_path: str = "best.pt") -> "BatchDetector":
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._init(model_path)
+        return cls._instance
+
+    def _init(self, model_path: str) -> None:
+        self.model_path = model_path
         self.model = YOLO(model_path)
+
         try:
             import torch
             if torch.cuda.is_available():
                 self.device = 0
                 gpu_name = torch.cuda.get_device_name(0)
-                logger.info("YOLO running on GPU: %s", gpu_name)
+                logger.info("BatchDetector running on GPU: %s", gpu_name)
             else:
                 self.device = "cpu"
-                logger.warning("YOLO running on CPU (CUDA not available)")
+                logger.warning("BatchDetector running on CPU (CUDA not available)")
         except Exception:
             self.device = "cpu"
-            logger.warning("YOLO running on CPU (torch import failed)")
+            logger.warning("BatchDetector running on CPU (torch import failed)")
         self.model.to(self.device)
-
-        if self.device != "cpu":
-            logger.info("YOLO detector using GPU (CUDA device %s)", self.device)
-        else:
-            logger.warning("YOLO detector using CPU -- install CUDA-enabled PyTorch for GPU acceleration")
         self.class_names = self.model.names
-        self.model_lock = threading.Lock()
+
+        self._streams: dict[str, object] = {}
+        self._pending_frames: dict[str, np.ndarray] = {}
+        self._pending_lock = threading.Lock()
 
         self.trackers: dict[str, sv.ByteTrack] = {}
         self.trails: dict[str, dict[int, list[tuple[float, float]]]] = {}
         self.trail_age: dict[str, dict[int, int]] = {}
         self.frame_counts: dict[str, int] = {}
-        self._latest_detections: dict[str, list[dict[str, object]]] = {}
 
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
-        self.trace_annotator = sv.TraceAnnotator()
 
-    def detect(self, frame: np.ndarray, cam_id: str = "default") -> np.ndarray:
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+        self._fps = 0.0
+        self._total_frames_processed = 0
+        self._last_fps_time = time.perf_counter()
+
+    def register_stream(self, cam_id: str, stream: object) -> None:
+        self._streams[cam_id] = stream
+
+    def unregister_stream(self, cam_id: str) -> None:
+        self._streams.pop(cam_id, None)
+        with self._pending_lock:
+            self._pending_frames.pop(cam_id, None)
+        self.trackers.pop(cam_id, None)
+        self.trails.pop(cam_id, None)
+        self.trail_age.pop(cam_id, None)
+        self.frame_counts.pop(cam_id, None)
+
+    def submit(self, cam_id: str, frame: np.ndarray) -> None:
+        with self._pending_lock:
+            self._pending_frames[cam_id] = frame.copy()
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger.info("BatchDetector started (batch_size=%d)", BATCH_SIZE)
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+        logger.info("BatchDetector stopped (total frames: %d, avg FPS: %.1f)",
+                     self._total_frames_processed, self._fps)
+
+    def _loop(self) -> None:
+        while self._running:
+            batch_cam_ids: list[str] = []
+            batch_frames: list[np.ndarray] = []
+
+            with self._pending_lock:
+                items = list(self._pending_frames.items())
+                self._pending_frames.clear()
+
+            for cam_id, frame in items:
+                if cam_id not in self._streams:
+                    continue
+                batch_cam_ids.append(cam_id)
+                batch_frames.append(frame)
+                if len(batch_frames) >= BATCH_SIZE:
+                    self._process_batch(batch_cam_ids, batch_frames)
+                    batch_cam_ids = []
+                    batch_frames = []
+
+            if batch_frames:
+                self._process_batch(batch_cam_ids, batch_frames)
+
+            time.sleep(0.01)
+
+    def _process_batch(self, cam_ids: list[str], frames: list[np.ndarray]) -> None:
+        results = self.model(frames, device=self.device, verbose=False)
+        for i, (cam_id, frame) in enumerate(zip(cam_ids, frames)):
+            self._process_single(cam_id, frame, results[i])
+
+        self._total_frames_processed += len(frames)
+        now = time.perf_counter()
+        elapsed = now - self._last_fps_time
+        if elapsed >= 5.0:
+            self._fps = self._total_frames_processed / elapsed
+            self._total_frames_processed = 0
+            self._last_fps_time = now
+            logger.info("BatchDetector FPS: %.1f (%d cameras active)",
+                         self._fps, len(self._streams))
+
+    def _process_single(self, cam_id: str, frame: np.ndarray, result) -> None:
         if cam_id not in self.trackers:
             self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
             self.trails[cam_id] = {}
@@ -64,10 +146,7 @@ class YOLODetector:
 
         self.frame_counts[cam_id] += 1
 
-        with self.model_lock:
-            results = self.model(frame, device=self.device, verbose=False)
-
-        detections = sv.Detections.from_ultralytics(results[0])
+        detections = sv.Detections.from_ultralytics(result)
 
         if len(detections) > 0:
             detections = self.trackers[cam_id].update_with_detections(detections)
@@ -105,7 +184,6 @@ class YOLODetector:
                 "confidence": conf,
                 "bbox": xyxy,
             })
-        self._latest_detections[cam_id] = detection_list
 
         CameraDataStore().update(
             camera_id=cam_id,
@@ -142,22 +220,6 @@ class YOLODetector:
             del self.trails[cam_id][track_id]
             self.trail_age.get(cam_id, {}).pop(track_id, None)
 
-        self._frame_count += 1
-        now = time.perf_counter()
-        elapsed = now - self._last_time
-        if elapsed >= 1.0:
-            self._fps = self._frame_count / elapsed
-            self._frame_count = 0
-            self._last_time = now
-
-        cv2.putText(
-            frame,
-            f"FPS: {self._fps:.1f}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-
-        return frame
+        stream = self._streams.get(cam_id)
+        if stream is not None:
+            stream.set_processed_frame(frame)

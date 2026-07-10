@@ -5,10 +5,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from app.modules.yolo import YOLODetector
-from app.modules.lstm.predictor import risk_predictor
+from app.modules.yolo.batch_detector import BatchDetector
 from app.utils.camera_manager import CameraConfig
-import time as time_module
 
 TEST_FRAME_W = 640
 TEST_FRAME_H = 480
@@ -19,13 +17,10 @@ OBJ_CENTER_X = 0
 
 
 class CameraStream:
-    def __init__(self, config: CameraConfig, yolo: YOLODetector):
+    def __init__(self, config: CameraConfig, batch_detector: BatchDetector):
         self.config = config
-        self.yolo = yolo
-        self._latest_frame: Optional[np.ndarray] = None
-        self._latest_frame_id: int = -1
+        self.batch_detector = batch_detector
         self._frame_id: int = 0
-        self._lock = threading.Lock()
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
         self._use_test_frame = False
@@ -34,9 +29,11 @@ class CameraStream:
 
         self._raw_frame: Optional[np.ndarray] = None
         self._raw_lock = threading.Lock()
-        self._raw_ready = threading.Event()
         self._cap_thread: Optional[threading.Thread] = None
-        self._det_thread: Optional[threading.Thread] = None
+
+        self._processed_frame: Optional[np.ndarray] = None
+        self._processed_frame_id: int = -1
+        self._processed_lock = threading.Lock()
 
     @property
     def camera_id(self) -> str:
@@ -61,32 +58,24 @@ class CameraStream:
             return
         self._running = True
         self._frame_ready.clear()
-        self._raw_ready.clear()
 
         self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._cap_thread.start()
 
-        self._det_thread = threading.Thread(target=self._detection_loop, daemon=True)
-        self._det_thread.start()
-
     def stop(self) -> None:
         self._running = False
-        self._raw_ready.set()
-        for thread in [self._cap_thread, self._det_thread]:
-            if thread is not None:
-                thread.join(timeout=5)
+        if self._cap_thread is not None:
+            self._cap_thread.join(timeout=5)
         self._cap_thread = None
-        self._det_thread = None
         if self._cap is not None:
             self._cap.release()
             self._cap = None
-        with self._lock:
-            self._latest_frame = None
-            self._latest_frame_id = -1
+        with self._processed_lock:
+            self._processed_frame = None
+            self._processed_frame_id = -1
         with self._raw_lock:
             self._raw_frame = None
         self._frame_ready.clear()
-        self._raw_ready.clear()
 
     def _init_rtsp(self) -> bool:
         cap = cv2.VideoCapture(self.config.url, cv2.CAP_FFMPEG)
@@ -113,10 +102,9 @@ class CameraStream:
 
             with self._raw_lock:
                 self._raw_frame = frame.copy()
-            self._raw_ready.set()
+            self._frame_id += 1
 
-            if not self._frame_ready.is_set():
-                self._frame_id += 1
+            self.batch_detector.submit(self.config.id, frame)
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = FRAME_INTERVAL - elapsed
@@ -127,107 +115,6 @@ class CameraStream:
             self._cap.release()
             self._cap = None
 
-    def _detection_loop(self) -> None:
-        first_detected = False
-        prev_positions: dict[int, dict] = {}
-        prev_velocities: dict[int, float] = {}
-        PIXEL_TO_METER = 0.05
-
-        while self._running:
-            if not self._raw_ready.wait(timeout=1.0):
-                continue
-            self._raw_ready.clear()
-
-            with self._raw_lock:
-                if self._raw_frame is None:
-                    continue
-                raw = self._raw_frame.copy()
-
-            frame_id = self._frame_id
-            timestamp_ms = int(time_module.time() * 1000)
-            prev_ms = self._prev_timestamp if hasattr(self, "_prev_timestamp") else timestamp_ms - 33
-            self._prev_timestamp = timestamp_ms
-            dt_sec = max((timestamp_ms - prev_ms) / 1000.0, 0.001)
-
-            processed = self.yolo.detect(raw, cam_id=self.config.id)
-            processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-
-            raw_dets = self.yolo._latest_detections.get(self.config.id, [])
-            enriched: list[dict] = []
-            current: dict[int, dict] = {}
-
-            for det in raw_dets:
-                track_id = int(det.get("track_id", -1))
-                if track_id < 0:
-                    continue
-                bbox = det.get("bbox", [0, 0, 0, 0])
-                cx = (bbox[0] + bbox[2]) / 2
-                cy = (bbox[1] + bbox[3]) / 2
-                current[track_id] = {"cx": cx, "cy": cy}
-
-                prev = prev_positions.get(track_id)
-                if prev:
-                    dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
-                    vel = (dp * PIXEL_TO_METER) / dt_sec
-                else:
-                    vel = 0.0
-                prev_vel = prev_velocities.get(track_id, vel)
-                acc = (vel - prev_vel) / dt_sec
-
-                section_id = 0
-                if prev:
-                    if cx < prev["cx"]:
-                        section_id = 1
-
-                preceding_id, headway = self._find_preceding(track_id, section_id, current)
-
-                enriched.append({
-                    "track_id": track_id,
-                    "class_name": det.get("class_name", ""),
-                    "confidence": det.get("confidence", 0.0),
-                    "bbox": bbox,
-                    "velocity": vel,
-                    "acceleration": acc,
-                    "section_id": section_id,
-                    "preceding_id": preceding_id,
-                    "space_headway": headway * PIXEL_TO_METER,
-                })
-
-                prev_velocities[track_id] = vel
-
-            prev_positions = current
-
-            if enriched:
-                try:
-                    risk_predictor.process_frame(self.config.id, frame_id, timestamp_ms, enriched)
-                except Exception:
-                    pass
-
-            with self._lock:
-                self._latest_frame = processed_rgb
-                self._latest_frame_id = frame_id
-
-            if not first_detected:
-                first_detected = True
-                self._frame_ready.set()
-
-    @staticmethod
-    def _find_preceding(track_id: int, section_id: int, all_current: dict[int, dict]) -> tuple[int, float]:
-        this = all_current.get(track_id)
-        if not this:
-            return -1, 0.0
-        best_id = -1
-        best_dist = float("inf")
-        for other_id, other in all_current.items():
-            if other_id == track_id:
-                continue
-            dy = this["cy"] - other["cy"]
-            if dy > 0:
-                dist = abs(dy)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_id = other_id
-        return best_id, best_dist if best_id >= 0 else 0.0
 
     def _generate_test_frame(self) -> np.ndarray:
         global OBJ_CENTER_X
@@ -267,7 +154,21 @@ class CameraStream:
         return frame
 
     def get_latest_frame(self) -> tuple[Optional[np.ndarray], int]:
-        with self._lock:
-            if self._latest_frame is None:
+        with self._processed_lock:
+            if self._processed_frame is None:
                 return None, -1
-            return self._latest_frame.copy(), self._latest_frame_id
+            return self._processed_frame.copy(), self._processed_frame_id
+
+    def get_raw_frame(self) -> tuple[Optional[np.ndarray], int]:
+        with self._raw_lock:
+            if self._raw_frame is None:
+                return None, -1
+            return self._raw_frame.copy(), self._frame_id
+
+    def set_processed_frame(self, frame: np.ndarray) -> None:
+        processed_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with self._processed_lock:
+            self._processed_frame = processed_rgb
+            self._processed_frame_id = self._frame_id
+        if not self._frame_ready.is_set():
+            self._frame_ready.set()

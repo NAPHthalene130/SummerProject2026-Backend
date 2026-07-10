@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+*.log
+.env
+.venv
+venv
+config.yaml
+logs
+.pytest_cache
+app/data/orderImg/*
+!app/data/orderImg/.gitkeep
