@@ -1,0 +1,46 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-this-root-password}
+      MYSQL_DATABASE: ${SP2026_DB_NAME:-summer_project_2026}
+      MYSQL_USER: ${SP2026_DB_USERNAME:-summer_project}
+      MYSQL_PASSWORD: ${SP2026_DB_PASSWORD:-change-this-database-password}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts/init_mysql.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      SP2026_DEBUG: "false"
+      SP2026_HOST: "0.0.0.0"
+      SP2026_PORT: "8000"
+      SP2026_ENABLE_STREAMING: "false"
+      SP2026_ENABLE_TRAFFIC_ANALYST: "false"
+      SP2026_DB_HOST: mysql
+      SP2026_DB_PORT: "3306"
+      SP2026_DB_USERNAME: ${SP2026_DB_USERNAME:-summer_project}
+      SP2026_DB_PASSWORD: ${SP2026_DB_PASSWORD:-change-this-database-password}
+      SP2026_DB_NAME: ${SP2026_DB_NAME:-summer_project_2026}
+      SP2026_DB_CHARSET: utf8mb4
+      SP2026_CORS_ORIGINS: '["*"]'
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - order_images:/app/app/data/orderImg
+
+volumes:
+  mysql_data:
+  order_images:
