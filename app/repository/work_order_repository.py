@@ -3,11 +3,18 @@ from typing import Any, Optional
 
 from app.database import mysql_connection
 from app.models.user import StaffResponse
-from app.models.work_order import WorkOrderItemResponse, WorkOrderStatus
+from app.models.work_order import WorkOrderItemResponse, WorkOrderStage, WorkOrderStatus
 
 
 UNRESOLVED_STATUSES = {"unassigned", "pending", "processing"}
-SOLVED_STATUSES = {"completed", "false_alarm"}
+TERMINAL_STATUSES = {"completed", "ignored"}
+WORK_ORDER_STATUS_BY_STAGE = {
+    "unassigned": WorkOrderStatus.UNRESOLVED,
+    "pending": WorkOrderStatus.UNRESOLVED,
+    "processing": WorkOrderStatus.UNRESOLVED,
+    "completed": WorkOrderStatus.RESOLVED,
+    "ignored": WorkOrderStatus.IGNORED,
+}
 
 
 def parse_work_order_id(work_order_id: str) -> int:
@@ -67,7 +74,7 @@ class WorkOrderRepository:
                     INSERT INTO work_orders (
                       event_id, camera_id, camera_name,
                       work_order_type, work_order_describe, work_order_img_url,
-                      work_order_rank, work_order_status, work_order_is_solve,
+                      work_order_rank, work_order_stage, work_order_status,
                       work_order_time, scene_info
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'unassigned', 0, %s, %s)
                     """,
@@ -153,7 +160,8 @@ class WorkOrderRepository:
                       u.user_type,
                       COUNT(
                         CASE
-                          WHEN wo.work_order_status IN ('pending', 'processing') THEN 1
+                          WHEN wo.work_order_status = 0
+                           AND wo.work_order_stage IN ('pending', 'processing') THEN 1
                         END
                       ) AS active_order_count
                     FROM users u
@@ -197,8 +205,8 @@ class WorkOrderRepository:
                 cursor.execute(
                     """
                     UPDATE work_orders
-                    SET work_order_status = 'pending',
-                        work_order_is_solve = 0,
+                    SET work_order_stage = 'pending',
+                        work_order_status = 0,
                         completed_at = NULL
                     WHERE work_order_id = %s
                     """,
@@ -210,24 +218,25 @@ class WorkOrderRepository:
     @staticmethod
     def update_work_order_status(
         work_order_id: str,
-        status: WorkOrderStatus,
+        status: WorkOrderStage,
         process_message: Optional[str] = None,
         process_image_url: Optional[str] = None,
     ) -> Optional[WorkOrderItemResponse]:
         numeric_id = parse_work_order_id(work_order_id)
-        is_solved = status in SOLVED_STATUSES
+        status_code = WORK_ORDER_STATUS_BY_STAGE[status]
+        is_terminal = status in TERMINAL_STATUSES
 
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     UPDATE work_orders
-                    SET work_order_status = %s,
-                        work_order_is_solve = %s,
-                        completed_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE completed_at END
+                    SET work_order_stage = %s,
+                        work_order_status = %s,
+                        completed_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE NULL END
                     WHERE work_order_id = %s
                     """,
-                    (status, int(is_solved), int(is_solved), numeric_id),
+                    (status, int(status_code), int(is_terminal), numeric_id),
                 )
                 cursor.execute(
                     """
@@ -238,7 +247,7 @@ class WorkOrderRepository:
                     (status, numeric_id),
                 )
 
-                if is_solved and process_message:
+                if is_terminal and process_message:
                     cursor.execute(
                         """
                         INSERT INTO work_order_replies (
@@ -256,12 +265,17 @@ class WorkOrderRepository:
 
     @staticmethod
     def _row_to_response(row: dict[str, Any]) -> WorkOrderItemResponse:
-        status = row.get("work_order_status") or (
-            "completed" if row.get("work_order_is_solve") else "unassigned"
-        )
+        status_code = WorkOrderStatus(int(row.get("work_order_status") or 0))
+        status = str(row.get("work_order_stage") or "unassigned")
+        if status_code == WorkOrderStatus.IGNORED:
+            status = "ignored"
+        elif status_code == WorkOrderStatus.RESOLVED:
+            status = "completed"
+        elif status not in UNRESOLVED_STATUSES:
+            status = "unassigned"
         process_images = split_images(row.get("work_order_reply_img_url"))
         completed_at = row.get("completed_at") or (
-            row.get("work_order_reply_time") if status in SOLVED_STATUSES else None
+            row.get("work_order_reply_time") if status in TERMINAL_STATUSES else None
         )
 
         return WorkOrderItemResponse(
@@ -276,6 +290,7 @@ class WorkOrderRepository:
             event_time=format_datetime(row.get("work_order_time")) or "",
             event_level=rank_to_level(int(row.get("work_order_rank") or 0)),
             status=status,
+            work_order_status=status_code,
             assignee=row.get("assignee"),
             description=row.get("work_order_describe") or "",
             ai_suggestion=row.get("ai_suggestion") or "建议联系现场人员确认情况，并按事件等级进行派发。",

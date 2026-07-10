@@ -54,11 +54,16 @@ REQUIRED_COLUMNS = (
     ),
     (
         "work_orders",
-        "work_order_status",
-        "ADD COLUMN `work_order_status` VARCHAR(64) NOT NULL DEFAULT 'unassigned' "
+        "work_order_stage",
+        "ADD COLUMN `work_order_stage` VARCHAR(64) NOT NULL DEFAULT 'unassigned' "
         "AFTER `work_order_time`",
     ),
-    ("work_orders", "ai_suggestion", "ADD COLUMN `ai_suggestion` TEXT NULL AFTER `work_order_is_solve`"),
+    (
+        "work_orders",
+        "work_order_status",
+        "ADD COLUMN `work_order_status` INT NOT NULL DEFAULT 0 AFTER `work_order_stage`",
+    ),
+    ("work_orders", "ai_suggestion", "ADD COLUMN `ai_suggestion` TEXT NULL AFTER `work_order_status`"),
     ("work_orders", "scene_info", "ADD COLUMN `scene_info` TEXT NULL AFTER `ai_suggestion`"),
     ("work_orders", "completed_at", "ADD COLUMN `completed_at` DATETIME NULL AFTER `scene_info`"),
     (
@@ -90,8 +95,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/172033/f4f8ff?text=Gaoxin+Accident",
         "work_order_rank": 3,
         "work_order_time": "2026-07-09 09:15:00",
-        "work_order_status": "unassigned",
-        "work_order_is_solve": 0,
+        "work_order_stage": "unassigned",
+        "work_order_status": 0,
         "ai_suggestion": "建议优先确认现场人员安全，临时封控右侧车道，并联动交警与清障车辆。",
         "scene_info": "画面显示 2 辆小客车低速接触，后方车辆出现连续变道。",
         "completed_at": None,
@@ -109,8 +114,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/2c2f39/f4f8ff?text=Construction+Queue",
         "work_order_rank": 2,
         "work_order_time": "2026-07-09 09:22:00",
-        "work_order_status": "pending",
-        "work_order_is_solve": 0,
+        "work_order_stage": "pending",
+        "work_order_status": 0,
         "ai_suggestion": "建议核查施工占道范围，补充临时警示牌，调整高峰绕行提示。",
         "scene_info": "施工区外侧车道通行能力下降，排队影响创新路东向西车流。",
         "completed_at": None,
@@ -128,8 +133,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/1b3044/f4f8ff?text=Campus+Entrance",
         "work_order_rank": 2,
         "work_order_time": "2026-07-09 09:30:00",
-        "work_order_status": "processing",
-        "work_order_is_solve": 0,
+        "work_order_stage": "processing",
+        "work_order_status": 0,
         "ai_suggestion": "建议安排现场疏导，开放临停区，并优化入口排队动线。",
         "scene_info": "入口等待车辆约 18 辆，非机动车与机动车有短时交织。",
         "completed_at": None,
@@ -147,8 +152,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/14263a/f4f8ff?text=Illegal+Parking",
         "work_order_rank": 1,
         "work_order_time": "2026-07-09 08:40:00",
-        "work_order_status": "completed",
-        "work_order_is_solve": 1,
+        "work_order_stage": "completed",
+        "work_order_status": 1,
         "ai_suggestion": "建议巡检提醒驶离，并纳入重点观察点。",
         "scene_info": "违停车辆停靠约 4 分钟，未造成持续拥堵。",
         "completed_at": "2026-07-09 08:58:00",
@@ -166,8 +171,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/253142/f4f8ff?text=Manhole+Check",
         "work_order_rank": 1,
         "work_order_time": "2026-07-09 08:10:00",
-        "work_order_status": "completed",
-        "work_order_is_solve": 1,
+        "work_order_stage": "completed",
+        "work_order_status": 1,
         "ai_suggestion": "建议复核井盖状态，如存在松动及时安排市政维修。",
         "scene_info": "疑似偏移区域位于慢行车道边缘。",
         "completed_at": "2026-07-09 08:35:00",
@@ -185,8 +190,8 @@ SEED_WORK_ORDERS = (
         "work_order_img_url": "https://placehold.co/640x360/202b3b/f4f8ff?text=False+Alarm",
         "work_order_rank": 1,
         "work_order_time": "2026-07-09 07:52:00",
-        "work_order_status": "false_alarm",
-        "work_order_is_solve": 1,
+        "work_order_stage": "ignored",
+        "work_order_status": 2,
         "ai_suggestion": "建议将该样本加入误报样本库，优化施工人员识别标签。",
         "scene_info": "现场为路侧保洁人员在隔离区域作业。",
         "completed_at": "2026-07-09 08:05:00",
@@ -198,7 +203,7 @@ SEED_ORDER_USERS = (
     (2, 3, 3, "2026-07-09 09:31:00", "processing"),
     (3, 4, 1, "2026-07-09 08:45:00", "completed"),
     (4, 5, 4, "2026-07-09 08:12:00", "completed"),
-    (5, 6, 1, "2026-07-09 07:54:00", "false_alarm"),
+    (5, 6, 1, "2026-07-09 07:54:00", "ignored"),
 )
 
 SEED_WORK_ORDER_REPLIES = (
@@ -289,6 +294,135 @@ def column_exists(cursor: Any, table_name: str, column_name: str) -> bool:
     return count > 0
 
 
+def column_data_type(cursor: Any, table_name: str, column_name: str) -> str | None:
+    cursor.execute(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    if isinstance(row, dict):
+        value = next(
+            (value for key, value in row.items() if str(key).lower() == "data_type"),
+            None,
+        )
+    else:
+        value = row[0]
+    return str(value).lower() if value is not None else None
+
+
+def index_columns(cursor: Any, table_name: str, index_name: str) -> list[str]:
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND index_name = %s
+        ORDER BY seq_in_index
+        """,
+        (table_name, index_name),
+    )
+    rows = cursor.fetchall()
+    columns: list[str] = []
+    for row in rows:
+        if isinstance(row, dict):
+            value = next(
+                (value for key, value in row.items() if str(key).lower() == "column_name"),
+                None,
+            )
+        else:
+            value = row[0]
+        if value is not None:
+            columns.append(str(value))
+    return columns
+
+
+def ensure_single_column_index(cursor: Any, table_name: str, index_name: str, column_name: str) -> None:
+    existing_columns = index_columns(cursor, table_name, index_name)
+    if existing_columns == [column_name]:
+        return
+    if existing_columns:
+        cursor.execute(f"ALTER TABLE `{table_name}` DROP INDEX `{index_name}`")
+    cursor.execute(f"ALTER TABLE `{table_name}` ADD INDEX `{index_name}` (`{column_name}`)")
+
+
+def migrate_work_order_status_schema(cursor: Any) -> None:
+    """Migrate legacy boolean/string status columns to status-code + stage."""
+    integer_types = {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
+    status_type = column_data_type(cursor, "work_orders", "work_order_status")
+
+    if status_type is not None and status_type not in integer_types:
+        if column_exists(cursor, "work_orders", "work_order_stage"):
+            cursor.execute(
+                "UPDATE work_orders SET work_order_stage = work_order_status "
+                "WHERE work_order_status IS NOT NULL"
+            )
+            cursor.execute("ALTER TABLE work_orders DROP COLUMN work_order_status")
+        else:
+            cursor.execute(
+                "ALTER TABLE work_orders CHANGE COLUMN work_order_status work_order_stage "
+                "VARCHAR(64) NOT NULL DEFAULT 'unassigned'"
+            )
+
+    if not column_exists(cursor, "work_orders", "work_order_stage"):
+        cursor.execute(
+            "ALTER TABLE work_orders ADD COLUMN work_order_stage "
+            "VARCHAR(64) NOT NULL DEFAULT 'unassigned' AFTER work_order_time"
+        )
+
+    if not column_exists(cursor, "work_orders", "work_order_status"):
+        if column_exists(cursor, "work_orders", "work_order_is_solve"):
+            cursor.execute(
+                "ALTER TABLE work_orders CHANGE COLUMN work_order_is_solve work_order_status "
+                "INT NOT NULL DEFAULT 0"
+            )
+        else:
+            cursor.execute(
+                "ALTER TABLE work_orders ADD COLUMN work_order_status "
+                "INT NOT NULL DEFAULT 0 AFTER work_order_stage"
+            )
+
+    cursor.execute(
+        """
+        UPDATE work_orders
+        SET work_order_status = CASE
+          WHEN work_order_stage IN ('ignored', 'false_alarm') THEN 2
+          WHEN work_order_stage = 'completed' THEN 1
+          ELSE 0
+        END,
+        work_order_stage = CASE
+          WHEN work_order_stage = 'false_alarm' THEN 'ignored'
+          ELSE work_order_stage
+        END
+        """
+    )
+
+    if column_exists(cursor, "work_orders", "work_order_is_solve"):
+        old_index_columns = index_columns(cursor, "work_orders", "idx_work_orders_is_solve")
+        if old_index_columns:
+            cursor.execute("ALTER TABLE work_orders DROP INDEX idx_work_orders_is_solve")
+        cursor.execute("ALTER TABLE work_orders DROP COLUMN work_order_is_solve")
+
+    cursor.execute(
+        "ALTER TABLE work_orders MODIFY COLUMN work_order_stage "
+        "VARCHAR(64) NOT NULL DEFAULT 'unassigned'"
+    )
+    cursor.execute(
+        "ALTER TABLE work_orders MODIFY COLUMN work_order_status "
+        "INT NOT NULL DEFAULT 0 COMMENT '0=unresolved, 1=resolved, 2=ignored'"
+    )
+    ensure_single_column_index(cursor, "work_orders", "idx_work_orders_status", "work_order_status")
+    ensure_single_column_index(cursor, "work_orders", "idx_work_orders_stage", "work_order_stage")
+
+
 def ensure_required_columns(cursor: Any) -> None:
     for table_name, column_name, alter_clause in REQUIRED_COLUMNS:
         if not column_exists(cursor, table_name, column_name):
@@ -328,8 +462,8 @@ def seed_work_orders(cursor: Any) -> int:
               work_order_img_url,
               work_order_rank,
               work_order_time,
+              work_order_stage,
               work_order_status,
-              work_order_is_solve,
               ai_suggestion,
               scene_info,
               completed_at
@@ -347,8 +481,8 @@ def seed_work_orders(cursor: Any) -> int:
               %(work_order_img_url)s,
               %(work_order_rank)s,
               %(work_order_time)s,
+              %(work_order_stage)s,
               %(work_order_status)s,
-              %(work_order_is_solve)s,
               %(ai_suggestion)s,
               %(scene_info)s,
               %(completed_at)s
@@ -365,8 +499,8 @@ def seed_work_orders(cursor: Any) -> int:
               work_order_img_url = VALUES(work_order_img_url),
               work_order_rank = VALUES(work_order_rank),
               work_order_time = VALUES(work_order_time),
+              work_order_stage = VALUES(work_order_stage),
               work_order_status = VALUES(work_order_status),
-              work_order_is_solve = VALUES(work_order_is_solve),
               ai_suggestion = VALUES(ai_suggestion),
               scene_info = VALUES(scene_info),
               completed_at = VALUES(completed_at)
@@ -464,6 +598,7 @@ def main() -> None:
             for statement in split_sql(schema_sql):
                 cursor.execute(statement)
 
+            migrate_work_order_status_schema(cursor)
             ensure_required_columns(cursor)
             user_count = seed_users(cursor)
             work_order_count = seed_work_orders(cursor)

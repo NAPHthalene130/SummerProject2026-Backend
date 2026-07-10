@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import IntEnum
 from typing import Literal, Optional
 
 from pydantic import BaseModel
@@ -11,10 +12,17 @@ class WorkOrder(BaseModel):
     work_order_img_url: str
     work_order_rank: int
     work_order_time: datetime
-    work_order_is_solve: bool
+    work_order_stage: str
+    work_order_status: int
 
 
-WorkOrderStatus = Literal["unassigned", "pending", "processing", "completed", "false_alarm"]
+class WorkOrderStatus(IntEnum):
+    UNRESOLVED = 0
+    RESOLVED = 1
+    IGNORED = 2
+
+
+WorkOrderStage = Literal["unassigned", "pending", "processing", "completed", "ignored"]
 WorkOrderLevel = Literal["low", "medium", "high"]
 
 
@@ -29,7 +37,8 @@ class WorkOrderItemResponse(BaseModel):
     accident_info: str
     event_time: str
     event_level: WorkOrderLevel
-    status: WorkOrderStatus
+    status: WorkOrderStage
+    work_order_status: WorkOrderStatus
     assignee: Optional[str] = None
     description: str
     ai_suggestion: str
@@ -45,6 +54,6 @@ class WorkOrderDispatchRequest(BaseModel):
 
 
 class WorkOrderStatusUpdateRequest(BaseModel):
-    status: WorkOrderStatus
+    status: WorkOrderStage
     process_message: Optional[str] = None
     process_image_url: Optional[str] = None

@@ -51,17 +51,17 @@ CREATE TABLE IF NOT EXISTS `work_orders` (
   `work_order_img_url` VARCHAR(1024) NOT NULL,
   `work_order_rank` INT NOT NULL DEFAULT 0,
   `work_order_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  `work_order_status` VARCHAR(64) NOT NULL DEFAULT 'unassigned',
-  `work_order_is_solve` TINYINT(1) NOT NULL DEFAULT 0,
+  `work_order_stage` VARCHAR(64) NOT NULL DEFAULT 'unassigned',
+  `work_order_status` INT NOT NULL DEFAULT 0 COMMENT '0=unresolved, 1=resolved, 2=ignored',
   `ai_suggestion` TEXT NULL,
   `scene_info` TEXT NULL,
   `completed_at` DATETIME NULL,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`work_order_id`),
-  INDEX `idx_work_orders_is_solve` (`work_order_is_solve`),
   INDEX `idx_work_orders_rank` (`work_order_rank`),
-  INDEX `idx_work_orders_status` (`work_order_status`)
+  INDEX `idx_work_orders_status` (`work_order_status`),
+  INDEX `idx_work_orders_stage` (`work_order_stage`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `work_order_replies` (

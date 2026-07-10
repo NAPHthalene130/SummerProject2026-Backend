@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 ANALYSIS_INTERVAL = 5.0
 MAX_CONCURRENT_ANALYSES = 30
 SCHEDULER_MAX_SLEEP = 0.5
+MIN_INCIDENT_CONFIDENCE = 0.85
+FRAME_BUFFER_SIZE = 5
 JPEG_QUALITY = 85
 
 
@@ -42,6 +45,7 @@ class TrafficAnalyst:
             cls._instance._camera_tasks: dict[str, asyncio.Task] = {}
             cls._instance._next_analysis: dict[str, float] = {}
             cls._instance._analysis_semaphore: Optional[asyncio.Semaphore] = None
+            cls._instance._frame_buffer: dict[str, list[str]] = {}
         return cls._instance
 
     def _load_prompt(self) -> str:
@@ -62,6 +66,7 @@ class TrafficAnalyst:
         self._client = self._init_client()
         self._camera_tasks = {}
         self._next_analysis = {}
+        self._frame_buffer = {}
         self._analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
         logger.info(
             "TrafficAnalyst started, model=%s, interval=%ss, max_concurrency=%d",
@@ -83,6 +88,7 @@ class TrafficAnalyst:
             self._task = None
         await self._cancel_camera_tasks()
         self._next_analysis.clear()
+        self._frame_buffer.clear()
         self._analysis_semaphore = None
         if self._client is not None:
             await self._client.close()
@@ -146,6 +152,7 @@ class TrafficAnalyst:
 
         for camera_id in stale_camera_ids:
             self._next_analysis.pop(camera_id, None)
+            self._frame_buffer.pop(camera_id, None)
             task = self._camera_tasks.pop(camera_id, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -190,59 +197,84 @@ class TrafficAnalyst:
             return
 
         image_b64 = await asyncio.to_thread(self._frame_to_base64, frame)
-        result = await self._call_multimodal(image_b64)
-        logger.info("Camera %s VLM raw response: %s", camera_id, result)
+
+        buffer = self._frame_buffer.setdefault(camera_id, [])
+        buffer.append(image_b64)
+        if len(buffer) > FRAME_BUFFER_SIZE:
+            buffer.pop(0)
+
+        images = list(buffer)
+        result = await self._call_multimodal(images)
         incident = self._parse_response(camera_id, result)
 
         store = CameraDataStore()
         store.update_incident_result(camera_id, incident)
 
-        logger.info(
-            "Camera %s analysis: incident=%s, type=%s",
-            camera_id,
-            incident.incident_detected,
-            incident.incident_type,
-        )
-
         if incident.incident_detected:
-            newly_active = store.activate_incident(camera_id)
-            if newly_active:
-                image_path = await asyncio.to_thread(self._save_incident_frame, frame, camera_id)
-                await asyncio.to_thread(self._create_work_order, camera_id, incident, image_path)
+            logger.info(
+                "Camera %s analysis: incident=%s, confidence=%.3f, type=%s",
+                camera_id,
+                incident.incident_detected,
+                incident.confidence,
+                incident.incident_type,
+            )
+
+            cleared_types = store.register_analysis_result(camera_id, incident.incident_type)
+            self._log_cleared_incidents(camera_id, cleared_types)
+
+            if store.is_incident_active(camera_id, incident.incident_type):
+                # The same camera and incident type identify one active event.
+                # Observing it again refreshes its lifecycle without a duplicate.
+                return
+
+            image_path = await asyncio.to_thread(self._save_incident_frame, frame, camera_id)
+            work_order_created = await asyncio.to_thread(
+                self._create_work_order,
+                camera_id,
+                incident,
+                image_path,
+            )
+            if work_order_created:
+                # Only mark the incident active after the database insert
+                # succeeds. A failed insert is retried on the next result.
+                store.activate_incident(camera_id, incident.incident_type)
+            else:
+                logger.warning(
+                    "Camera %s incident remains pending because work order creation failed",
+                    camera_id,
+                )
         else:
-            if store.is_incident_active(camera_id):
-                cleared = store.register_normal_result(camera_id)
-                if cleared:
-                    logger.info(
-                        "Camera %s incident cleared after %d consecutive normal frames",
-                        camera_id,
-                        CONSECUTIVE_NORMAL_THRESHOLD,
-                    )
+            cleared_types = store.register_analysis_result(camera_id, None)
+            self._log_cleared_incidents(camera_id, cleared_types)
+
+    def _log_cleared_incidents(self, camera_id: str, incident_types: list[str]) -> None:
+        for incident_type in incident_types:
+            logger.info(
+                "Camera %s incident type %s cleared after %d consecutive normal analyses",
+                camera_id,
+                incident_type,
+                CONSECUTIVE_NORMAL_THRESHOLD,
+            )
 
     def _frame_to_base64(self, frame: np.ndarray) -> str:
         _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         return base64.b64encode(buffer).decode("utf-8")
 
-    async def _call_multimodal(self, image_b64: str) -> str:
+    async def _call_multimodal(self, images_b64: list[str]) -> str:
+        content: list[dict] = [{"type": "text", "text": self._prompt}]
+        if len(images_b64) > 1:
+            content.insert(0, {
+                "type": "text",
+                "text": f"以下是从该摄像头采集的连续 {len(images_b64)} 帧画面（按时间顺序，最早的在最前面，最新的在最后面），请结合帧间变化进行综合分析：\n\n",
+            })
+        for img in images_b64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img}"},
+            })
         response = await self._client.chat.completions.create(
             model=llm_settings.model_name,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": self._prompt,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}",
-                            },
-                        },
-                    ],
-                },
-            ],
+            messages=[{"role": "user", "content": content}],
             max_tokens=500,
             temperature=0.1,
         )
@@ -259,6 +291,7 @@ class TrafficAnalyst:
             incident_detected=False,
             incident_type="正常",
             description="模型返回解析失败",
+            confidence=0.0,
         )
 
         try:
@@ -270,8 +303,46 @@ class TrafficAnalyst:
         if not isinstance(data, dict):
             return default
 
-        incident_detected = bool(data.get("incident_detected", False))
-        incident_type = str(data.get("incident_type", "正常"))
+        raw_incident_detected = data.get("incident_detected", False)
+        if isinstance(raw_incident_detected, bool):
+            incident_detected = raw_incident_detected
+        elif isinstance(raw_incident_detected, str):
+            normalized = raw_incident_detected.strip().lower()
+            if normalized in {"true", "false"}:
+                incident_detected = normalized == "true"
+            else:
+                logger.warning("Invalid incident_detected value: %r", raw_incident_detected)
+                incident_detected = False
+        else:
+            logger.warning("Invalid incident_detected type: %r", raw_incident_detected)
+            incident_detected = False
+
+        raw_confidence = data.get("confidence", 0.0)
+        try:
+            if isinstance(raw_confidence, bool):
+                raise ValueError
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            logger.warning("Invalid incident confidence: %r", raw_confidence)
+            confidence = 0.0
+
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            logger.warning("Incident confidence outside [0, 1]: %r", raw_confidence)
+            confidence = 0.0
+
+        if incident_detected and confidence < MIN_INCIDENT_CONFIDENCE:
+            logger.info(
+                "Incident downgraded to normal because confidence %.3f is below %.3f",
+                confidence,
+                MIN_INCIDENT_CONFIDENCE,
+            )
+            incident_detected = False
+
+        incident_type = str(data.get("incident_type", "正常")).strip()
+        if incident_detected and (not incident_type or incident_type == "正常"):
+            incident_type = "其他事故"
+        elif not incident_detected:
+            incident_type = "正常"
         description = str(data.get("description", ""))
 
         return TrafficIncidentResult(
@@ -279,6 +350,7 @@ class TrafficAnalyst:
             incident_detected=incident_detected,
             incident_type=incident_type,
             description=description,
+            confidence=confidence,
         )
 
     def _save_incident_frame(self, frame: np.ndarray, camera_id: str) -> str:
@@ -291,7 +363,7 @@ class TrafficAnalyst:
         logger.info("Incident frame saved: %s", filepath)
         return f"/orderImg/{filename}"
 
-    def _create_work_order(self, camera_id: str, incident: TrafficIncidentResult, image_path: str) -> None:
+    def _create_work_order(self, camera_id: str, incident: TrafficIncidentResult, image_path: str) -> bool:
         cam_config = CameraManager().get_by_id(camera_id)
         camera_name = cam_config.name if cam_config else camera_id
         rank = get_incident_rank(incident.incident_type)
@@ -311,5 +383,7 @@ class TrafficAnalyst:
                 incident.incident_type,
                 rank,
             )
+            return True
         else:
             logger.error("Failed to create work order for camera %s", camera_id)
+            return False
