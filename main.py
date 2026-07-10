@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
-from app.config import settings
+from app.config import llm_settings, settings
 from app.utils.camera_manager import CameraManager
 from app.modules.agent.traffic_analyst import TrafficAnalyst
 from app.modules.stream import StreamManager
@@ -44,20 +44,31 @@ logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    cameras = CameraManager().get_all()
-    logger.info("Loaded %d cameras from config", len(cameras))
-    for cam in cameras:
-        logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
+    if settings.ENABLE_STREAMING:
+        cameras = CameraManager().get_all()
+        logger.info("Loaded %d cameras from config", len(cameras))
+        for cam in cameras:
+            logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
+            StreamManager().subscribe(cam.id)
+            logger.info("  Subscribed camera %s for analysis", cam.id)
+    else:
+        logger.info("Camera streaming disabled; running in API-only mode")
 
-    for cam in cameras:
-        StreamManager().subscribe(cam.id)
-        logger.info("  Subscribed camera %s for analysis", cam.id)
+    traffic_analyst_enabled = (
+        settings.ENABLE_TRAFFIC_ANALYST
+        and llm_settings.api_key not in {"", "your_api_key_here"}
+    )
+    if traffic_analyst_enabled:
+        await TrafficAnalyst().start()
+    else:
+        logger.info("TrafficAnalyst disabled by configuration or missing API key")
 
-    await TrafficAnalyst().start()
     yield
-    await TrafficAnalyst().stop()
-    StreamManager().stop_all()
 
+    if traffic_analyst_enabled:
+        await TrafficAnalyst().stop()
+    if settings.ENABLE_STREAMING:
+        StreamManager().stop_all()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

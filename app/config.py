@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List
@@ -57,6 +58,8 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     API_V1_PREFIX: str = "/api/v1"
+    ENABLE_STREAMING: bool = True
+    ENABLE_TRAFFIC_ANALYST: bool = True
 
     CORS_ORIGINS: List[str] = ["*"]
 
@@ -72,7 +75,16 @@ settings = Settings()
 
 @lru_cache
 def get_database_settings() -> DatabaseSettings:
-    data = load_yaml_config().get("database", {})
+    data = dict(load_yaml_config().get("database", {}))
+    environment_values = {
+        "host": os.getenv("SP2026_DB_HOST"),
+        "port": os.getenv("SP2026_DB_PORT"),
+        "username": os.getenv("SP2026_DB_USERNAME"),
+        "password": os.getenv("SP2026_DB_PASSWORD"),
+        "name": os.getenv("SP2026_DB_NAME"),
+        "charset": os.getenv("SP2026_DB_CHARSET"),
+    }
+    data.update({key: value for key, value in environment_values.items() if value not in {None, ""}})
     return DatabaseSettings.model_validate(data)
 
 
@@ -81,7 +93,13 @@ database_settings = get_database_settings()
 
 @lru_cache
 def get_llm_settings() -> LLMSettings:
-    data = load_yaml_config().get("llm", {})
+    data = dict(load_yaml_config().get("llm", {}))
+    environment_values = {
+        "url": os.getenv("SP2026_LLM_URL"),
+        "api_key": os.getenv("SP2026_LLM_API_KEY"),
+        "model_name": os.getenv("SP2026_LLM_MODEL_NAME"),
+    }
+    data.update({key: value for key, value in environment_values.items() if value not in {None, ""}})
     return LLMSettings.model_validate(data)
 
 
