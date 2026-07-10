@@ -24,7 +24,9 @@ from app.utils.camera_manager import CameraManager
 
 logger = logging.getLogger(__name__)
 
-ANALYSIS_INTERVAL = 3.0
+ANALYSIS_INTERVAL = 5.0
+MAX_CONCURRENT_ANALYSES = 30
+SCHEDULER_MAX_SLEEP = 0.5
 JPEG_QUALITY = 85
 
 
@@ -37,6 +39,9 @@ class TrafficAnalyst:
             cls._instance._client: Optional[AsyncOpenAI] = None
             cls._instance._prompt: str = ""
             cls._instance._task: Optional[asyncio.Task] = None
+            cls._instance._camera_tasks: dict[str, asyncio.Task] = {}
+            cls._instance._next_analysis: dict[str, float] = {}
+            cls._instance._analysis_semaphore: Optional[asyncio.Semaphore] = None
         return cls._instance
 
     def _load_prompt(self) -> str:
@@ -51,11 +56,19 @@ class TrafficAnalyst:
         )
 
     async def start(self) -> None:
-        if self._task is not None:
+        if self._task is not None and not self._task.done():
             return
         self._prompt = self._load_prompt()
         self._client = self._init_client()
-        logger.info("TrafficAnalyst started, model=%s, interval=%ss", llm_settings.model_name, ANALYSIS_INTERVAL)
+        self._camera_tasks = {}
+        self._next_analysis = {}
+        self._analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
+        logger.info(
+            "TrafficAnalyst started, model=%s, interval=%ss, max_concurrency=%d",
+            llm_settings.model_name,
+            ANALYSIS_INTERVAL,
+            MAX_CONCURRENT_ANALYSES,
+        )
         self._task = asyncio.create_task(self._analysis_loop())
 
     async def stop(self) -> None:
@@ -65,34 +78,110 @@ class TrafficAnalyst:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.exception("TrafficAnalyst scheduler stopped unexpectedly")
             self._task = None
+        await self._cancel_camera_tasks()
+        self._next_analysis.clear()
+        self._analysis_semaphore = None
         if self._client is not None:
             await self._client.close()
             self._client = None
         logger.info("TrafficAnalyst stopped")
 
     async def _analysis_loop(self) -> None:
-        last_analysis: dict[str, float] = {}
+        loop = asyncio.get_running_loop()
 
-        while True:
-            try:
-                now = time.time()
-                streams = StreamManager().get_all_streams()
+        try:
+            while True:
+                try:
+                    streams = StreamManager().get_all_streams()
+                    await self._remove_inactive_cameras(set(streams))
+                    now = loop.time()
+                    skipped_camera_ids: list[str] = []
 
-                for camera_id in list(streams.keys()):
-                    elapsed = now - last_analysis.get(camera_id, 0.0)
-                    if elapsed < ANALYSIS_INTERVAL:
-                        continue
+                    for camera_id, stream in streams.items():
+                        next_analysis = self._next_analysis.setdefault(camera_id, now)
+                        if now < next_analysis:
+                            continue
 
-                    last_analysis[camera_id] = now
-                    try:
-                        await self._analyze_camera(streams[camera_id], camera_id)
-                    except Exception:
-                        logger.exception("Analysis failed for camera %s", camera_id)
+                        intervals_elapsed = int((now - next_analysis) // ANALYSIS_INTERVAL) + 1
+                        self._next_analysis[camera_id] = next_analysis + intervals_elapsed * ANALYSIS_INTERVAL
 
-                await asyncio.sleep(0.5)
-            except asyncio.CancelledError:
-                raise
+                        current_task = self._camera_tasks.get(camera_id)
+                        if current_task is not None and not current_task.done():
+                            skipped_camera_ids.append(camera_id)
+                            continue
+
+                        self._camera_tasks[camera_id] = asyncio.create_task(
+                            self._analyze_camera_safely(stream, camera_id),
+                            name=f"traffic-analysis-{camera_id}",
+                        )
+
+                    if skipped_camera_ids:
+                        logger.warning(
+                            "Skipped this interval for %d camera(s) with analysis still running: %s",
+                            len(skipped_camera_ids),
+                            ", ".join(skipped_camera_ids),
+                        )
+
+                    await asyncio.sleep(self._scheduler_delay(loop.time()))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Traffic analysis scheduler iteration failed")
+                    await asyncio.sleep(SCHEDULER_MAX_SLEEP)
+        finally:
+            await self._cancel_camera_tasks()
+
+    def _scheduler_delay(self, now: float) -> float:
+        if not self._next_analysis:
+            return SCHEDULER_MAX_SLEEP
+        next_due = min(self._next_analysis.values())
+        return min(SCHEDULER_MAX_SLEEP, max(0.0, next_due - now))
+
+    async def _remove_inactive_cameras(self, active_camera_ids: set[str]) -> None:
+        stale_camera_ids = set(self._next_analysis) - active_camera_ids
+        cancelled_tasks: list[asyncio.Task] = []
+
+        for camera_id in stale_camera_ids:
+            self._next_analysis.pop(camera_id, None)
+            task = self._camera_tasks.pop(camera_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                cancelled_tasks.append(task)
+
+        if cancelled_tasks:
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+    async def _cancel_camera_tasks(self) -> None:
+        tasks = list(self._camera_tasks.values())
+        self._camera_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _analyze_camera_safely(self, stream, camera_id: str) -> None:
+        semaphore = self._analysis_semaphore
+        if semaphore is None:
+            return
+
+        started_at = time.perf_counter()
+        try:
+            async with semaphore:
+                await self._analyze_camera(stream, camera_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Analysis failed for camera %s", camera_id)
+        finally:
+            logger.debug(
+                "Camera %s analysis task finished in %.3fs",
+                camera_id,
+                time.perf_counter() - started_at,
+            )
 
     async def _analyze_camera(self, stream, camera_id: str) -> None:
         frame, frame_id = stream.get_raw_frame()
@@ -100,22 +189,13 @@ class TrafficAnalyst:
             logger.debug("No raw frame available for camera %s", camera_id)
             return
 
-        image_b64 = self._frame_to_base64(frame)
+        image_b64 = await asyncio.to_thread(self._frame_to_base64, frame)
         result = await self._call_multimodal(image_b64)
         logger.info("Camera %s VLM raw response: %s", camera_id, result)
         incident = self._parse_response(camera_id, result)
 
         store = CameraDataStore()
         store.update_incident_result(camera_id, incident)
-
-        print(
-            f"\n{'=' * 60}"
-            f"\n[TrafficAnalyst] Camera: {camera_id}"
-            f"\n  Incident Detected: {incident.incident_detected}"
-            f"\n  Incident Type:      {incident.incident_type}"
-            f"\n  Description:        {incident.description}"
-            f"\n{'=' * 60}"
-        )
 
         logger.info(
             "Camera %s analysis: incident=%s, type=%s",
@@ -127,8 +207,8 @@ class TrafficAnalyst:
         if incident.incident_detected:
             newly_active = store.activate_incident(camera_id)
             if newly_active:
-                image_path = self._save_incident_frame(frame, camera_id)
-                self._create_work_order(camera_id, incident, image_path)
+                image_path = await asyncio.to_thread(self._save_incident_frame, frame, camera_id)
+                await asyncio.to_thread(self._create_work_order, camera_id, incident, image_path)
         else:
             if store.is_incident_active(camera_id):
                 cleared = store.register_normal_result(camera_id)
@@ -137,10 +217,6 @@ class TrafficAnalyst:
                         "Camera %s incident cleared after %d consecutive normal frames",
                         camera_id,
                         CONSECUTIVE_NORMAL_THRESHOLD,
-                    )
-                    print(
-                        f"\n[TrafficAnalyst] Camera {camera_id}: incident state cleared "
-                        f"after {CONSECUTIVE_NORMAL_THRESHOLD} consecutive normal frames"
                     )
 
     def _frame_to_base64(self, frame: np.ndarray) -> str:
@@ -234,12 +310,6 @@ class TrafficAnalyst:
                 camera_id,
                 incident.incident_type,
                 rank,
-            )
-            print(
-                f"\n[WorkOrder] Created: {work_order.work_order_id}"
-                f" | Camera: {camera_id}"
-                f" | Type: {incident.incident_type}"
-                f" | Rank: {rank}"
             )
         else:
             logger.error("Failed to create work order for camera %s", camera_id)

@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,7 +22,22 @@ from app.modules.stream import StreamManager
 os.environ["AV_LOG_FORCE_COLOR"] = "0"
 av.logging.set_level(av.logging.FATAL)
 
-logging.basicConfig(level=logging.INFO)
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            _log_dir / "app.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
+)
 logger = logging.getLogger(__name__)
 logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
