@@ -6,7 +6,9 @@ import cv2
 import numpy as np
 
 from app.modules.yolo import YOLODetector
+from app.modules.lstm.predictor import risk_predictor
 from app.utils.camera_manager import CameraConfig
+import time as time_module
 
 TEST_FRAME_W = 640
 TEST_FRAME_H = 480
@@ -127,6 +129,10 @@ class CameraStream:
 
     def _detection_loop(self) -> None:
         first_detected = False
+        prev_positions: dict[int, dict] = {}
+        prev_velocities: dict[int, float] = {}
+        PIXEL_TO_METER = 0.05
+
         while self._running:
             if not self._raw_ready.wait(timeout=1.0):
                 continue
@@ -137,16 +143,91 @@ class CameraStream:
                     continue
                 raw = self._raw_frame.copy()
 
+            frame_id = self._frame_id
+            timestamp_ms = int(time_module.time() * 1000)
+            prev_ms = self._prev_timestamp if hasattr(self, "_prev_timestamp") else timestamp_ms - 33
+            self._prev_timestamp = timestamp_ms
+            dt_sec = max((timestamp_ms - prev_ms) / 1000.0, 0.001)
+
             processed = self.yolo.detect(raw, cam_id=self.config.id)
             processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
 
+            raw_dets = self.yolo._latest_detections.get(self.config.id, [])
+            enriched: list[dict] = []
+            current: dict[int, dict] = {}
+
+            for det in raw_dets:
+                track_id = int(det.get("track_id", -1))
+                if track_id < 0:
+                    continue
+                bbox = det.get("bbox", [0, 0, 0, 0])
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                current[track_id] = {"cx": cx, "cy": cy}
+
+                prev = prev_positions.get(track_id)
+                if prev:
+                    dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
+                    vel = (dp * PIXEL_TO_METER) / dt_sec
+                else:
+                    vel = 0.0
+                prev_vel = prev_velocities.get(track_id, vel)
+                acc = (vel - prev_vel) / dt_sec
+
+                section_id = 0
+                if prev:
+                    if cx < prev["cx"]:
+                        section_id = 1
+
+                preceding_id, headway = self._find_preceding(track_id, section_id, current)
+
+                enriched.append({
+                    "track_id": track_id,
+                    "class_name": det.get("class_name", ""),
+                    "confidence": det.get("confidence", 0.0),
+                    "bbox": bbox,
+                    "velocity": vel,
+                    "acceleration": acc,
+                    "section_id": section_id,
+                    "preceding_id": preceding_id,
+                    "space_headway": headway * PIXEL_TO_METER,
+                })
+
+                prev_velocities[track_id] = vel
+
+            prev_positions = current
+
+            if enriched:
+                try:
+                    risk_predictor.process_frame(self.config.id, frame_id, timestamp_ms, enriched)
+                except Exception:
+                    pass
+
             with self._lock:
                 self._latest_frame = processed_rgb
-                self._latest_frame_id = self._frame_id
+                self._latest_frame_id = frame_id
 
             if not first_detected:
                 first_detected = True
                 self._frame_ready.set()
+
+    @staticmethod
+    def _find_preceding(track_id: int, section_id: int, all_current: dict[int, dict]) -> tuple[int, float]:
+        this = all_current.get(track_id)
+        if not this:
+            return -1, 0.0
+        best_id = -1
+        best_dist = float("inf")
+        for other_id, other in all_current.items():
+            if other_id == track_id:
+                continue
+            dy = this["cy"] - other["cy"]
+            if dy > 0:
+                dist = abs(dy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_id = other_id
+        return best_id, best_dist if best_id >= 0 else 0.0
 
     def _generate_test_frame(self) -> np.ndarray:
         global OBJ_CENTER_X
