@@ -9,6 +9,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from app.modules.camera_data import BoundingBoxItem, CameraDataStore
+from app.modules.lstm.predictor import risk_predictor
 
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
@@ -66,6 +67,11 @@ class BatchDetector:
         self._fps = 0.0
         self._total_frames_processed = 0
         self._last_fps_time = time.perf_counter()
+
+        self._prev_positions: dict[str, dict[int, dict]] = {}
+        self._prev_velocities: dict[str, dict[int, float]] = {}
+        self._prev_timestamps: dict[str, int] = {}
+        self.PIXEL_TO_METER = 0.05
 
     def register_stream(self, cam_id: str, stream: object) -> None:
         self._streams[cam_id] = stream
@@ -198,6 +204,74 @@ class BatchDetector:
                 for d in detection_list
             ],
         )
+
+        timestamp_ms = int(time.time() * 1000)
+        prev_ms = self._prev_timestamps.get(cam_id, timestamp_ms - 33)
+        self._prev_timestamps[cam_id] = timestamp_ms
+        dt_sec = max((timestamp_ms - prev_ms) / 1000.0, 0.001)
+
+        if cam_id not in self._prev_positions:
+            self._prev_positions[cam_id] = {}
+        if cam_id not in self._prev_velocities:
+            self._prev_velocities[cam_id] = {}
+
+        current_positions: dict[int, dict] = {}
+        enriched: list[dict] = []
+
+        for det in detection_list:
+            track_id = int(det.get("track_id", -1))
+            if track_id < 0:
+                continue
+            bbox = det.get("bbox", [0, 0, 0, 0])
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            current_positions[track_id] = {"cx": cx, "cy": cy}
+
+            prev = self._prev_positions[cam_id].get(track_id)
+            if prev:
+                dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
+                vel = (dp * self.PIXEL_TO_METER) / dt_sec
+            else:
+                vel = 0.0
+            prev_vel = self._prev_velocities[cam_id].get(track_id, vel)
+            acc = (vel - prev_vel) / dt_sec
+
+            section_id = 0
+            if prev and cx < prev["cx"]:
+                section_id = 1
+
+            preceding_id, headway = -1, 0.0
+            for other_id, other in current_positions.items():
+                if other_id == track_id:
+                    continue
+                dy = cy - other["cy"]
+                if dy > 0:
+                    dist = abs(dy)
+                    if dist < (headway if headway > 0 else float("inf")):
+                        headway = dist
+                        preceding_id = other_id
+
+            enriched.append({
+                "track_id": track_id,
+                "class_name": det.get("class_name", ""),
+                "confidence": det.get("confidence", 0.0),
+                "bbox": bbox,
+                "velocity": vel,
+                "acceleration": acc,
+                "section_id": section_id,
+                "preceding_id": preceding_id,
+                "space_headway": headway * self.PIXEL_TO_METER,
+            })
+
+            self._prev_velocities[cam_id][track_id] = vel
+
+        self._prev_positions[cam_id] = current_positions
+
+        if enriched:
+            try:
+                risk_predictor.process_frame(cam_id, self.frame_counts[cam_id], timestamp_ms, enriched)
+            except Exception:
+                pass
 
         frame = self.box_annotator.annotate(scene=frame, detections=detections)
         frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
