@@ -172,31 +172,33 @@ class WorkOrderRepository:
                       u.user_name,
                       u.user_type,
                       u.personnel_category,
+                      u.user_work_describe,
                       COUNT(
                         CASE
                           WHEN wo.work_order_status = 0
                            AND wo.work_order_stage IN ('pending', 'processing') THEN 1
                         END
-                      ) AS active_order_count
+                      ) AS work_order_count
                     FROM users u
                     LEFT JOIN order_user ou ON ou.user_id = u.user_id
                     LEFT JOIN work_orders wo ON wo.work_order_id = ou.work_order_id
-                    GROUP BY u.user_id, u.user_name, u.user_type
+                    GROUP BY u.user_id, u.user_name, u.user_type, u.personnel_category, u.user_work_describe
                     ORDER BY u.user_id
                     """
                 )
                 staff: list[StaffResponse] = []
                 for row in cursor.fetchall():
-                    active_count = int(row["active_order_count"] or 0)
+                    work_count = int(row["work_order_count"] or 0)
                     user_id = int(row["user_id"])
                     staff.append(
                         StaffResponse(
                             id=str(user_id),
                             name=row["user_name"],
                             role=row["user_type"],
-                            status="busy" if active_count else "idle",
+                            work_order_count=work_count,
                             distance_km=round(0.45 + (user_id % 5) * 0.35, 1),
                             personnel_category=row.get("personnel_category") or "traffic_police",
+                            user_work_describe=row.get("user_work_describe"),
                         )
                     )
                 return staff

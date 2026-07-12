@@ -10,16 +10,16 @@ class UserNameAlreadyExistsError(ValueError):
 
 class UserRepository:
     @staticmethod
-    def create_user(user_name: str, user_password: str, user_type: str) -> UserResponse:
+    def create_user(user_name: str, user_password: str, user_type: str, user_work_describe: Optional[str] = None) -> UserResponse:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
                 try:
                     cursor.execute(
                         """
-                        INSERT INTO users (user_name, user_password, user_type)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO users (user_name, user_password, user_type, user_work_describe)
+                        VALUES (%s, %s, %s, %s)
                         """,
-                        (user_name, user_password, user_type),
+                        (user_name, user_password, user_type, user_work_describe),
                     )
                 except Exception as exc:
                     if getattr(exc, "args", (None,))[0] == 1062:
@@ -29,6 +29,7 @@ class UserRepository:
                     user_id=cursor.lastrowid,
                     user_name=user_name,
                     user_type=user_type,
+                    user_work_describe=user_work_describe,
                 )
 
     @staticmethod
@@ -37,7 +38,7 @@ class UserRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_password, user_type
+                    SELECT user_id, user_name, user_password, user_type, user_work_describe
                     FROM users
                     WHERE user_id = %s
                     """,
@@ -52,7 +53,7 @@ class UserRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_password, user_type
+                    SELECT user_id, user_name, user_password, user_type, user_work_describe
                     FROM users
                     WHERE user_name = %s
                     """,
@@ -67,7 +68,7 @@ class UserRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_type
+                    SELECT user_id, user_name, user_type, user_work_describe
                     FROM users
                     ORDER BY user_id
                     """
@@ -79,8 +80,9 @@ class UserRepository:
         user_id: int,
         user_name: str,
         user_type: str,
-        user_password: str | None = None,
-    ) -> UserResponse | None:
+        user_password: Optional[str] = None,
+        user_work_describe: Optional[str] = None,
+    ) -> Optional["UserResponse"]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
                 fields = ["user_name = %s", "user_type = %s"]
@@ -88,6 +90,9 @@ class UserRepository:
                 if user_password is not None:
                     fields.append("user_password = %s")
                     values.append(user_password)
+                if user_work_describe is not None:
+                    fields.append("user_work_describe = %s")
+                    values.append(user_work_describe)
                 values.append(user_id)
 
                 try:
@@ -101,7 +106,7 @@ class UserRepository:
                     raise
 
                 cursor.execute(
-                    "SELECT user_id, user_name, user_type FROM users WHERE user_id = %s",
+                    "SELECT user_id, user_name, user_type, user_work_describe FROM users WHERE user_id = %s",
                     (user_id,),
                 )
                 row = cursor.fetchone()

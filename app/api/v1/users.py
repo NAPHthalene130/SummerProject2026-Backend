@@ -20,6 +20,7 @@ async def create_user(request: UserCreateRequest):
             user_name=request.user_name,
             user_password=hash_password(request.password),
             user_type=request.user_type,
+            user_work_describe=request.user_work_describe,
         )
     except UserNameAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail="用户名已存在") from exc
@@ -33,6 +34,7 @@ async def update_user(user_id: int, request: UserUpdateRequest):
             user_name=request.user_name,
             user_type=request.user_type,
             user_password=hash_password(request.password) if request.password else None,
+            user_work_describe=request.user_work_describe,
         )
     except UserNameAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail="用户名已存在") from exc

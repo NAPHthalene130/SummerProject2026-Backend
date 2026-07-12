@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -8,18 +8,21 @@ class UserRecord(BaseModel):
     user_name: str
     user_password: str
     user_type: str
+    user_work_describe: Optional[str] = None
 
 
 class UserResponse(BaseModel):
     user_id: int
     user_name: str
     user_type: str
+    user_work_describe: Optional[str] = None
 
 
 class UserCreateRequest(BaseModel):
     user_name: str = Field(min_length=1, max_length=255)
     user_type: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=8, max_length=128)
+    user_work_describe: Optional[str] = Field(default=None, max_length=512)
 
     @field_validator("user_name", "user_type")
     @classmethod
@@ -32,7 +35,8 @@ class UserCreateRequest(BaseModel):
 class UserUpdateRequest(BaseModel):
     user_name: str = Field(min_length=1, max_length=255)
     user_type: str = Field(min_length=1, max_length=64)
-    password: str | None = Field(default=None, min_length=8, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    user_work_describe: Optional[str] = Field(default=None, max_length=512)
 
     @field_validator("user_name", "user_type")
     @classmethod
@@ -46,9 +50,10 @@ class StaffResponse(BaseModel):
     id: str
     name: str
     role: str
-    status: Literal["idle", "busy"]
+    work_order_count: int = 0
     distance_km: float
     personnel_category: str = "traffic_police"
+    user_work_describe: Optional[str] = None
 
 
 class MobileUserRegisterRequest(BaseModel):
@@ -71,3 +76,5 @@ class MobileUserResponse(BaseModel):
     personnel_category: str
     role_name: str
     site: str = ""
+
+    model_config = {"extra": "allow"}

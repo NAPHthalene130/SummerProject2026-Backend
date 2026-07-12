@@ -24,6 +24,7 @@ def ensure_schema(cursor):
     add_column("users", "phone", "VARCHAR(32) NULL")
     add_column("users", "personnel_category", "VARCHAR(64) NOT NULL DEFAULT 'traffic_police'")
     add_column("users", "site", "VARCHAR(255) NULL")
+    add_column("users", "user_work_describe", "VARCHAR(512) NULL")
     add_column("work_orders", "required_category", "VARCHAR(64) NOT NULL DEFAULT 'traffic_police'")
     legacy_groups = (
         (1, "交警执法一组", "traffic_police"),
