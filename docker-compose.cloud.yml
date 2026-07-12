@@ -1,4 +1,23 @@
 services:
+  turn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TURNSERVER_ENABLED: "true"
+    command: >
+      -n --listening-port=3478
+      --min-port=49152 --max-port=65535
+      --fingerprint --lt-cred-mech
+      --user=${TURN_USER:-summer}:${TURN_PASSWORD:-change-this-turn-password}
+      --realm=${TURN_REALM:-autodl}
+      --log-file=stdout
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3478 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
   mysql:
     image: mysql:8.4
     restart: unless-stopped
@@ -33,7 +52,7 @@ services:
       SP2026_DB_NAME: ${SP2026_DB_NAME:-summer_project_2026}
       SP2026_DB_CHARSET: utf8mb4
       SP2026_CORS_ORIGINS: '["*"]'
-      SP2026_ICE_SERVERS: ${SP2026_ICE_SERVERS:-stun:stun.l.google.com:19302}
+      SP2026_ICE_SERVERS: ${SP2026_ICE_SERVERS:-stun:stun.l.google.com:19302;turn:${TURN_HOST:-127.0.0.1}:3478,username=${TURN_USER:-summer},credential=${TURN_PASSWORD:-change-this-turn-password}}
     depends_on:
       mysql:
         condition: service_healthy
