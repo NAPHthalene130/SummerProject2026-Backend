@@ -13,6 +13,7 @@ supervision>=0.22.0,<1.0.0
 openai>=1.0.0,<3.0.0
 langchain>=1.0.0,<2.0.0
 langchain-openai>=1.0.0,<2.0.0
+chromadb>=1.5.9,<2.0.0
 PyMySQL>=1.1.0,<2.0.0
 pwdlib[argon2]>=0.2.0,<1.0.0
 torch>=2.0.0

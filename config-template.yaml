@@ -11,6 +11,15 @@ llm:
   api_key: "your_api_key_here"
   model_name: "your_model_name_here"
 
+embedding:
+  url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key: "your_api_key_here"
+  model_name: "text-embedding-v4"
+  dimensions: 1024
+  # 每条法条单独请求 embedding，最多同时处理 10 条。
+  concurrency: 10
+  timeout: 60.0
+
 cameras:
   - id: "cam-01"
     name: "苏州街-海淀南路"
