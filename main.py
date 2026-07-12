@@ -56,12 +56,16 @@ async def lifespan(application: FastAPI):
     logger.info("Loaded %d cameras from config", len(cameras))
     for cam in cameras:
         logger.info("  [%s] %s -> %s", cam.id, cam.name, cam.url)
-    if settings.ENABLE_STREAMING:
+    has_http_relay = any(cam.url.startswith("http://") for cam in cameras)
+    if settings.ENABLE_STREAMING and not has_http_relay:
         for cam in cameras:
             StreamManager().subscribe(cam.id)
             logger.info("  Subscribed camera %s for analysis", cam.id)
     else:
-        logger.info("Camera streaming disabled; running in API-only mode")
+        if has_http_relay:
+            logger.info("HTTP relay mode: cameras subscribed on demand via MJPEG proxy")
+        else:
+            logger.info("Camera streaming disabled; running in API-only mode")
 
     model_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "traffic_risk_lstm_weights.pth")
     scaler_path = os.path.join(os.path.dirname(__file__), "app", "modules", "lstm", "scaler_params.json")
