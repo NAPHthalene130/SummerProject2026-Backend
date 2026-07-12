@@ -60,9 +60,8 @@ RELAY_BASE = os.getenv("SP2026_RELAY_URL", "http://127.0.0.1:8889")
 @live_router.get("/{camera_id}/mjpeg")
 async def camera_mjpeg(camera_id: str):
     relay_url = f"{RELAY_BASE}/{camera_id}"
-    RETRY_LIMIT = 3
     
-    for attempt in range(RETRY_LIMIT):
+    for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 req = client.build_request("GET", relay_url)
@@ -77,10 +76,10 @@ async def camera_mjpeg(camera_id: str):
                 
                 return StreamingResponse(
                     proxy_stream(),
-                    media_type=resp.headers.get("content-type", "multipart/x-mixed-replace; boundary=frame"),
+                    media_type="multipart/x-mixed-replace; boundary=frame",
                 )
         except Exception:
-            if attempt < RETRY_LIMIT - 1:
+            if attempt < 2:
                 import asyncio
                 await asyncio.sleep(1)
                 continue
