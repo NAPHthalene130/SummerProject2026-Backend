@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException
 from app.database import mysql_connection
-from app.models.mobile_report import MobileReportCreate, MobileReportResponse, ConvertReportRequest
+from app.models.mobile_report import MobileReportCreate, MobileReportResponse, ConvertReportRequest, RejectReportRequest
 from app.models.user import MobileUserLoginRequest, MobileUserRegisterRequest, MobileUserResponse
 from app.repository.work_order_repository import WorkOrderRepository, format_work_order_code
+from app.utils.passwords import hash_password, is_password_hash, verify_password
 
 router = APIRouter()
 
@@ -25,6 +26,10 @@ def ensure_schema(cursor):
     add_column("users", "personnel_category", "VARCHAR(64) NOT NULL DEFAULT 'traffic_police'")
     add_column("users", "site", "VARCHAR(255) NULL")
     add_column("work_orders", "required_category", "VARCHAR(64) NOT NULL DEFAULT 'traffic_police'")
+    add_column("work_order_replies", "requested_status", "VARCHAR(32) NULL")
+    add_column("work_order_replies", "review_message", "TEXT NULL")
+    add_column("work_order_replies", "reviewed_at", "DATETIME NULL")
+    add_column("work_order_replies", "submitted_by_user_id", "INT NULL")
     legacy_groups = (
         (1, "交警执法一组", "traffic_police"),
         (2, "道路养护一组", "road_maintenance"),
@@ -47,6 +52,8 @@ def ensure_schema(cursor):
         INDEX idx_mobile_reports_status(status), INDEX idx_mobile_reports_user(reporter_user_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
+    add_column("mobile_reports", "review_message", "TEXT NULL")
+    add_column("mobile_reports", "reviewed_at", "DATETIME NULL")
     repaired_reports = (
         (
             1,
@@ -98,7 +105,7 @@ def register(request: MobileUserRegisterRequest):
             cursor.execute("SELECT user_id FROM users WHERE phone=%s", (request.phone,))
             if cursor.fetchone(): raise HTTPException(409, "手机号已注册")
             cursor.execute("INSERT INTO users(user_name,user_password,user_type,phone,personnel_category,site) VALUES(%s,%s,%s,%s,%s,%s)",
-                (request.name, request.password, CATEGORIES[request.personnel_category], request.phone, request.personnel_category, request.site))
+                (request.name, hash_password(request.password), CATEGORIES[request.personnel_category], request.phone, request.personnel_category, request.site))
             user_id = cursor.lastrowid
             cursor.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
             return user_response(cursor.fetchone())
@@ -109,9 +116,18 @@ def login(request: MobileUserLoginRequest):
     with mysql_connection() as connection:
         with connection.cursor() as cursor:
             ensure_schema(cursor)
-            cursor.execute("SELECT * FROM users WHERE phone=%s AND user_password=%s", (request.phone, request.password))
+            cursor.execute("SELECT * FROM users WHERE phone=%s", (request.phone,))
             row = cursor.fetchone()
-            if not row: raise HTTPException(401, "手机号或密码错误")
+            if not row:
+                raise HTTPException(401, "账号不存在或已被删除")
+            saved_password = str(row.get("user_password") or "")
+            password_valid = (
+                verify_password(request.password, saved_password)
+                if is_password_hash(saved_password)
+                else request.password == saved_password
+            )
+            if not password_valid:
+                raise HTTPException(401, "手机号或密码错误")
             return user_response(row)
 
 
@@ -120,7 +136,8 @@ def report_response(row):
         reporter_name=row.get("reporter_name") or "", title=row["title"], location=row["location"], detail=row["detail"],
         severity=row["severity"], event_type=row["event_type"], image_urls=[x for x in (row.get("image_urls") or "").split(",") if x],
         status=row["status"], created_at=str(row["created_at"]),
-        work_order_id=format_work_order_code(row["work_order_id"], row["created_at"]) if row.get("work_order_id") else None)
+        work_order_id=format_work_order_code(row["work_order_id"], row["created_at"]) if row.get("work_order_id") else None,
+        review_message=row.get("review_message"), reviewed_at=str(row["reviewed_at"]) if row.get("reviewed_at") else None)
 
 
 @router.post("/mobile-reports", response_model=MobileReportResponse)
@@ -168,5 +185,21 @@ def convert_report(report_id: int, request: ConvertReportRequest):
         with connection.cursor() as cursor:
             numeric_id=int(order.work_order_id.rsplit("-",1)[-1])
             cursor.execute("UPDATE mobile_reports SET status='converted',work_order_id=%s WHERE report_id=%s", (numeric_id, report_id))
+            cursor.execute("SELECT r.*,u.user_name reporter_name FROM mobile_reports r LEFT JOIN users u ON u.user_id=r.reporter_user_id WHERE report_id=%s", (report_id,))
+            return report_response(cursor.fetchone())
+
+
+@router.post("/mobile-reports/{report_id}/reject", response_model=MobileReportResponse)
+def reject_report(report_id: int, request: RejectReportRequest):
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_schema(cursor)
+            cursor.execute(
+                "UPDATE mobile_reports SET status='rejected',review_message=%s,reviewed_at=CURRENT_TIMESTAMP "
+                "WHERE report_id=%s AND status='pending'",
+                (request.review_message, report_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(409, "上报不存在或已完成审核")
             cursor.execute("SELECT r.*,u.user_name reporter_name FROM mobile_reports r LEFT JOIN users u ON u.user_id=r.reporter_user_id WHERE report_id=%s", (report_id,))
             return report_response(cursor.fetchone())

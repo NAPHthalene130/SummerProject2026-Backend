@@ -108,7 +108,11 @@ class WorkOrderRepository:
                       u.user_name AS assignee,
                       reply.work_order_reply_msg,
                       reply.work_order_reply_img_url,
-                      reply.work_order_reply_time
+                      reply.work_order_reply_time,
+                      reply.work_order_reply_status,
+                      reply.requested_status,
+                      reply.review_message,
+                      reply.reviewed_at
                     FROM work_orders wo
                     LEFT JOIN order_user ou ON ou.work_order_id = wo.work_order_id
                     LEFT JOIN users u ON u.user_id = ou.user_id
@@ -142,7 +146,11 @@ class WorkOrderRepository:
                       u.user_name AS assignee,
                       reply.work_order_reply_msg,
                       reply.work_order_reply_img_url,
-                      reply.work_order_reply_time
+                      reply.work_order_reply_time,
+                      reply.work_order_reply_status,
+                      reply.requested_status,
+                      reply.review_message,
+                      reply.reviewed_at
                     FROM work_orders wo
                     LEFT JOIN order_user ou ON ou.work_order_id = wo.work_order_id
                     LEFT JOIN users u ON u.user_id = ou.user_id
@@ -239,25 +247,6 @@ class WorkOrderRepository:
         return WorkOrderRepository.get_work_order(str(numeric_id))
 
     @staticmethod
-    def delete_staff(user_id: int) -> bool:
-        with mysql_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT user_id FROM users WHERE user_id=%s", (user_id,))
-                if cursor.fetchone() is None:
-                    return False
-                cursor.execute(
-                    """
-                    UPDATE work_orders wo
-                    JOIN order_user ou ON ou.work_order_id = wo.work_order_id
-                    SET wo.work_order_stage='unassigned', wo.work_order_status=0
-                    WHERE ou.user_id=%s AND wo.work_order_status=0
-                    """,
-                    (user_id,),
-                )
-                cursor.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
-                return cursor.rowcount > 0
-
-    @staticmethod
     def update_work_order_status(
         work_order_id: str,
         status: WorkOrderStage,
@@ -306,6 +295,87 @@ class WorkOrderRepository:
         return WorkOrderRepository.get_work_order(str(numeric_id))
 
     @staticmethod
+    def submit_mobile_feedback(
+        work_order_id: str,
+        user_id: int,
+        requested_status: str,
+        process_message: str,
+        process_image_url: Optional[str] = None,
+    ) -> Optional[WorkOrderItemResponse]:
+        numeric_id = parse_work_order_id(work_order_id)
+        with mysql_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT wo.required_category,u.personnel_category FROM work_orders wo "
+                    "JOIN users u ON u.user_id=%s WHERE wo.work_order_id=%s",
+                    (user_id, numeric_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                if (row.get("required_category") or "traffic_police") != (row.get("personnel_category") or "traffic_police"):
+                    raise ValueError("只能提交本职责组工单的处置结果")
+                cursor.execute(
+                    "SELECT work_order_reply_id FROM work_order_replies "
+                    "WHERE work_order_id=%s AND work_order_reply_status=0 ORDER BY work_order_reply_id DESC LIMIT 1",
+                    (numeric_id,),
+                )
+                if cursor.fetchone():
+                    raise ValueError("已有处置结果等待电脑端审核")
+                cursor.execute(
+                    """
+                    INSERT INTO work_order_replies (
+                      work_order_id, work_order_reply_img_url, work_order_reply_msg,
+                      work_order_reply_status, requested_status, submitted_by_user_id
+                    ) VALUES (%s,%s,%s,0,%s,%s)
+                    """,
+                    (numeric_id, process_image_url or "", process_message, requested_status, user_id),
+                )
+                cursor.execute(
+                    "UPDATE work_orders SET work_order_stage='processing',work_order_status=0,completed_at=NULL WHERE work_order_id=%s",
+                    (numeric_id,),
+                )
+        return WorkOrderRepository.get_work_order(str(numeric_id))
+
+    @staticmethod
+    def review_mobile_feedback(
+        work_order_id: str,
+        decision: str,
+        review_message: Optional[str] = None,
+    ) -> Optional[WorkOrderItemResponse]:
+        numeric_id = parse_work_order_id(work_order_id)
+        with mysql_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT work_order_reply_id,requested_status FROM work_order_replies "
+                    "WHERE work_order_id=%s AND work_order_reply_status=0 ORDER BY work_order_reply_id DESC LIMIT 1",
+                    (numeric_id,),
+                )
+                reply = cursor.fetchone()
+                if reply is None:
+                    return None
+                approved = decision == "approve"
+                cursor.execute(
+                    "UPDATE work_order_replies SET work_order_reply_status=%s,review_message=%s,reviewed_at=CURRENT_TIMESTAMP "
+                    "WHERE work_order_reply_id=%s",
+                    (1 if approved else 2, review_message or ("审核通过" if approved else "审核未通过"), reply["work_order_reply_id"]),
+                )
+                if approved:
+                    requested_status = reply.get("requested_status") or "completed"
+                    status_code = WORK_ORDER_STATUS_BY_STAGE[requested_status]
+                    cursor.execute(
+                        "UPDATE work_orders SET work_order_stage=%s,work_order_status=%s,completed_at=CURRENT_TIMESTAMP WHERE work_order_id=%s",
+                        (requested_status, int(status_code), numeric_id),
+                    )
+                    cursor.execute("UPDATE order_user SET order_user_status=%s WHERE work_order_id=%s", (requested_status, numeric_id))
+                else:
+                    cursor.execute(
+                        "UPDATE work_orders SET work_order_stage='processing',work_order_status=0,completed_at=NULL WHERE work_order_id=%s",
+                        (numeric_id,),
+                    )
+        return WorkOrderRepository.get_work_order(str(numeric_id))
+
+    @staticmethod
     def _row_to_response(row: dict[str, Any]) -> WorkOrderItemResponse:
         status_code = WorkOrderStatus(int(row.get("work_order_status") or 0))
         status = str(row.get("work_order_stage") or "unassigned")
@@ -319,6 +389,14 @@ class WorkOrderRepository:
         completed_at = row.get("completed_at") or (
             row.get("work_order_reply_time") if status in TERMINAL_STATUSES else None
         )
+        reply_status = row.get("work_order_reply_status")
+        feedback_review_status = "none"
+        if reply_status == 0:
+            feedback_review_status = "pending"
+        elif reply_status == 1 and row.get("requested_status"):
+            feedback_review_status = "approved"
+        elif reply_status == 2:
+            feedback_review_status = "rejected"
 
         return WorkOrderItemResponse(
             work_order_id=format_work_order_code(row["work_order_id"], row.get("work_order_time")),
@@ -343,4 +421,7 @@ class WorkOrderRepository:
             process_images=process_images or None,
             completed_at=format_datetime(completed_at),
             required_category=row.get("required_category") or "traffic_police",
+            feedback_review_status=feedback_review_status,
+            feedback_requested_status=row.get("requested_status"),
+            feedback_review_message=row.get("review_message"),
         )
