@@ -12,8 +12,8 @@ LANE_CLASSES = {0, 2, 3, 5, 7}
 
 
 class RoadOrientation(Enum):
-    HORIZONTAL = "horizontal"
-    VERTICAL = "vertical"
+    LONGITUDINAL = "longitudinal"
+    TRANSVERSE = "transverse"
 
 
 class LaneInfo:
@@ -77,16 +77,16 @@ class RoadDetector:
         return lanes
 
     def _lane_orientations(self, lanes: list[LaneInfo]) -> tuple[list[float], list[float]]:
-        horiz, vert = [], []
+        longitudinal, transverse = [], []
         for lane in lanes:
             angle = abs(lane.angle % 180)
             if 30 < angle < 150:
-                vert.append(lane.angle)
+                transverse.append(lane.angle)
             else:
-                horiz.append(lane.angle)
-        return horiz, vert
+                longitudinal.append(lane.angle)
+        return longitudinal, transverse
 
-    def _calibrate_horizontal(self, lanes: list[LaneInfo]) -> bool:
+    def _calibrate_longitudinal(self, lanes: list[LaneInfo]) -> bool:
         points = []
         for lane in lanes:
             x1, y1 = lane.poly[0]
@@ -127,7 +127,7 @@ class RoadDetector:
         self.scale_cols = None
         return True
 
-    def _calibrate_vertical(self, lanes: list[LaneInfo]) -> bool:
+    def _calibrate_transverse(self, lanes: list[LaneInfo]) -> bool:
         x_positions = []
         for lane in lanes:
             cx = int(np.mean([p[0] for p in lane.poly]))
@@ -152,16 +152,16 @@ class RoadDetector:
         lanes = self.detect_lanes(frame)
         if not lanes:
             return False
-        horiz, vert = self._lane_orientations(lanes)
-        if len(vert) >= 2:
-            self.orientation = RoadOrientation.VERTICAL
-            ok = self._calibrate_vertical(lanes)
-        elif len(horiz) >= 2:
-            self.orientation = RoadOrientation.HORIZONTAL
-            ok = self._calibrate_horizontal(lanes)
+        longitudinal, transverse = self._lane_orientations(lanes)
+        if len(transverse) >= 2:
+            self.orientation = RoadOrientation.TRANSVERSE
+            ok = self._calibrate_transverse(lanes)
+        elif len(longitudinal) >= 2:
+            self.orientation = RoadOrientation.LONGITUDINAL
+            ok = self._calibrate_longitudinal(lanes)
         else:
             return False
-        self._lane_count = max(len(horiz), len(vert))
+        self._lane_count = max(len(longitudinal), len(transverse))
         self._calibrated = ok
         if ok:
             logger.info(
@@ -174,7 +174,7 @@ class RoadDetector:
     def pixel_distance_to_meters(self, y1: float, y2: float, dx_px: float) -> float:
         if not self._calibrated:
             return dx_px * 0.05
-        if self.orientation == RoadOrientation.VERTICAL and self.scale_cols is not None:
+        if self.orientation == RoadOrientation.TRANSVERSE and self.scale_cols is not None:
             return dx_px * float(self.scale_cols[0])
         m_per_px = (self.get_m_per_pixel(int(y1)) + self.get_m_per_pixel(int(y2))) / 2.0
         return dx_px * m_per_px
@@ -182,7 +182,7 @@ class RoadDetector:
     def get_m_per_pixel(self, row: int) -> float:
         if not self._calibrated:
             return 0.05
-        if self.orientation == RoadOrientation.VERTICAL and self.scale_cols is not None:
+        if self.orientation == RoadOrientation.TRANSVERSE and self.scale_cols is not None:
             return float(self.scale_cols[0])
         if self.scale_rows is None:
             return 0.05
@@ -197,7 +197,7 @@ class RoadDetector:
             label = f"VP ({self.orientation.value})" if self.orientation else "VP"
             cv2.putText(frame, label, (int(self.vp_x) + 8, int(self.vp_y) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        if self.orientation == RoadOrientation.HORIZONTAL:
+        if self.orientation == RoadOrientation.LONGITUDINAL:
             for row in range(0, self.frame_h, self.frame_h // 5):
                 mpp = self.get_m_per_pixel(row)
                 cv2.putText(frame, f"row{row}: {mpp:.4f}m/px",
