@@ -10,11 +10,15 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from typing import Optional
 
 import cv2
 import numpy as np
 import yaml
+
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+os.environ["AV_LOG_FORCE_COLOR"] = "0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,8 +32,8 @@ BACKEND_CONFIG = os.path.join(
 LOCAL_CONFIG = os.path.join(os.path.dirname(__file__), "cameras.yaml")
 HOST = "0.0.0.0"
 PORT = 8888
-FPS = 20
-JPEG_QUALITY = 60
+FPS = 10
+JPEG_QUALITY = 40
 
 
 class CameraCapture:
@@ -120,17 +124,30 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _serve_mjpeg(self, cam_id: str):
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Connection", "close")
         self.end_headers()
         cam = self.cameras[cam_id]
         boundary = b"--frame\r\n"
+        blank_jpg = cv2.imencode(".jpg", np.zeros((240, 320, 3), dtype=np.uint8))[1].tobytes()
+        max_wait = 200
+        waited = 0
         while True:
             frame = cam.get_frame()
-            if frame:
+            if frame is None:
+                if waited < max_wait:
+                    waited += 1
+                    time.sleep(0.1)
+                    continue
+                frame = blank_jpg
+            waited = 0
+            try:
                 self.wfile.write(boundary)
                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
                 self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                 self.wfile.write(frame)
                 self.wfile.write(b"\r\n")
+            except Exception:
+                break
             time.sleep(0.05)
 
     def log_message(self, format, *args):
@@ -168,7 +185,10 @@ def main():
         captures[cam_id] = cam
 
     RelayHandler.cameras = captures
-    server = HTTPServer((HOST, PORT), RelayHandler)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+    server = ThreadedHTTPServer((HOST, PORT), RelayHandler)
     logger.info("RTSP Relay running on http://%s:%d", HOST, PORT)
     logger.info("Cameras:")
     for cid, cam in captures.items():
