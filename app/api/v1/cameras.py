@@ -28,8 +28,27 @@ async def get_camera_stats():
     store = CameraDataStore()
     items: list[CameraStatsItem] = []
     for cam_id, data in store.get_all().items():
+        boxes_data = [
+            {"track_id": b.track_id, "class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox}
+            for b in data.boxes
+        ]
         items.append(CameraStatsItem(
             camera_id=cam_id,
             total_vehicle_count=data.total_vehicle_count,
+            boxes=boxes_data,
         ))
     return CameraStatsResponse(cameras=items)
+
+
+@cameras_router.get("/{camera_id}/boxes")
+async def get_camera_boxes(camera_id: str):
+    store = CameraDataStore()
+    data = store.get_by_camera_id(camera_id)
+    if data is None:
+        return {"boxes": []}
+    return {
+        "boxes": [
+            {"track_id": b.track_id, "class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox}
+            for b in data.boxes
+        ]
+    }
