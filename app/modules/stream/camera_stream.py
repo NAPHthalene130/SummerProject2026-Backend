@@ -43,6 +43,10 @@ class CameraStream:
     def subscriber_count(self) -> int:
         return self._subscriber_count
 
+    @property
+    def has_display_viewers(self) -> bool:
+        return self._subscriber_count > 1
+
     def add_subscriber(self) -> None:
         self._subscriber_count += 1
         if self._subscriber_count == 1:
@@ -104,7 +108,8 @@ class CameraStream:
                 self._raw_frame = frame.copy()
             self._frame_id += 1
 
-            self.batch_detector.submit(self.config.id, frame)
+            if self.has_display_viewers:
+                self.batch_detector.submit(self.config.id, frame)
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = FRAME_INTERVAL - elapsed

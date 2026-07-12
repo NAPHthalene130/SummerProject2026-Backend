@@ -1,147 +1,190 @@
-import logging
+"""
+YOLO 检测 + 跟踪模块
+集成到主系统后，外部通过 YOLODetector.detect(frame) 调用。
+"""
+
+import json
+import math
 import threading
 import time
+import warnings
 
 import cv2
 import numpy as np
-import supervision as sv
 from ultralytics import YOLO
+import supervision as sv
 
-from app.modules.camera_data import BoundingBoxItem, CameraDataStore
+warnings.filterwarnings("ignore", message=".*ByteTrack.*deprecated.*")
 
-logger = logging.getLogger(__name__)
+TRAFFIC_CLASSES = ["Truck", "Motorcycle", "Bus", "Bike", "car", "person"]
+COLORS = {
+    "Truck": (153, 204, 51),
+    "Motorcycle": (127, 188, 86),
+    "Bus": (102, 173, 122),
+    "Bike": (76, 158, 158),
+    "car": (50, 142, 193),
+    "person": (25, 127, 229),
+}
+COLOR_LIST = list(COLORS.values())
+COLOR_NAMES = list(COLORS.keys())
 
-LOST_BUFFER = 30
-TRAIL_MAX_AGE = 30
-
-logger = logging.getLogger(__name__)
+# 检测参数
+INFERENCE_SIZE = 320
+DETECTION_FPS = 30
+TRAIL_LEN = DETECTION_FPS  # 轨迹 = 1 秒
+LOST_BUFFER = 1
 
 
 class YOLODetector:
-    def __init__(self, model_path: str = "best.pt"):
+    """
+    ═══════════════════════════════════════════════════════
+    视频流接收接口:
+      外部将视频帧传入 detect(frame, cam_id) 即可。
+      每路摄像头独立追踪，cam_id 用于区分不同摄像头。
+    ═══════════════════════════════════════════════════════
+    处理结果传输接口:
+      - detect() 返回 annotated frame (绘制了框/轨迹/速度的帧)
+      - get_detections(cam_id) → dict: 最近一帧的检测结果 JSON
+      - get_all_detections() → dict: 所有摄像头的检测结果
+    ═══════════════════════════════════════════════════════
+    """
+
+    def __init__(self, model_path: str | None = None):
+        if model_path is None:
+            import os
+            model_path = os.path.join(os.path.dirname(__file__), "best.pt")
         self.model_path = model_path
         self._fps = 0.0
         self._frame_count = 0
         self._last_time = time.perf_counter()
 
+        # YOLO 模型
         self.model = YOLO(model_path)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self.device = 0
-                gpu_name = torch.cuda.get_device_name(0)
-                logger.info("YOLO running on GPU: %s", gpu_name)
-            else:
-                self.device = "cpu"
-                logger.warning("YOLO running on CPU (CUDA not available)")
-        except Exception:
-            self.device = "cpu"
-            logger.warning("YOLO running on CPU (torch import failed)")
-        self.model.to(self.device)
-
-        if self.device != "cpu":
-            logger.info("YOLO detector using GPU (CUDA device %s)", self.device)
-        else:
-            logger.warning("YOLO detector using CPU -- install CUDA-enabled PyTorch for GPU acceleration")
+        self.model.to("cuda")
         self.class_names = self.model.names
         self.model_lock = threading.Lock()
 
-        self.trackers: dict[str, sv.ByteTrack] = {}
-        self.trails: dict[str, dict[int, list[tuple[float, float]]]] = {}
-        self.trail_age: dict[str, dict[int, int]] = {}
-        self.frame_counts: dict[str, int] = {}
-        self._latest_detections: dict[str, list[dict[str, object]]] = {}
+        # 跟踪器 & 轨迹 (按摄像头独立)
+        self.trackers = {}
+        self.trails = {}
+        self.speed_displays = {}
+        self.frame_counts = {}
 
-        self.box_annotator = sv.BoxAnnotator()
-        self.label_annotator = sv.LabelAnnotator()
-        self.trace_annotator = sv.TraceAnnotator()
+        # 存储最新检测结果供外部获取
+        self._latest_detections = {}
+
+    # ── 公共接口 ────────────────────────────────────────
 
     def detect(self, frame: np.ndarray, cam_id: str = "default") -> np.ndarray:
+        """
+        视频流接收接口:
+          传入一帧 BGR 图像，返回绘制了检测框/轨迹/速度的帧。
+          cam_id 区分不同摄像头，追踪器按 cam_id 独立维护。
+        """
+        # 确保该摄像头有独立的追踪器
         if cam_id not in self.trackers:
-            self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
+            self.trackers[cam_id] = sv.ByteTrack(
+                lost_track_buffer=LOST_BUFFER
+            )
             self.trails[cam_id] = {}
+            self.speed_displays[cam_id] = {}
             self.frame_counts[cam_id] = 0
 
-        self.frame_counts[cam_id] += 1
-
-        with self.model_lock:
-            results = self.model(frame, device=self.device, verbose=False)
-
-        detections = sv.Detections.from_ultralytics(results[0])
-
-        if len(detections) > 0:
-            detections = self.trackers[cam_id].update_with_detections(detections)
+        # 缩放至推理尺寸
+        h, w = frame.shape[:2]
+        if w > INFERENCE_SIZE:
+            scale_r = INFERENCE_SIZE / w
+            small = cv2.resize(frame, (INFERENCE_SIZE, int(h * scale_r)))
         else:
-            detections.tracker_id = np.array([], dtype=int)
+            scale_r = 1
+            small = frame.copy()
 
-        labels: list[str] = []
-        detection_list: list[dict[str, object]] = []
-        for i in range(len(detections)):
-            if detections.tracker_id is not None and i < len(detections.tracker_id):
-                track_id = int(detections.tracker_id[i])
-            else:
-                track_id = -1
+        # YOLO 推理
+        with self.model_lock:
+            results = self.model(small, verbose=False)[0]
 
-            class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
-            class_name = self.class_names.get(class_id, f"cls_{class_id}")
-            conf = float(detections.confidence[i]) if detections.confidence is not None else 0.0
-            xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
+        det = sv.Detections.from_ultralytics(results)
 
-            labels.append(f"#{track_id} {class_name} {conf:.2f}")
+        # ByteTrack 跟踪
+        if len(det) > 0 and det.confidence is not None:
+            det = self.trackers[cam_id].update_with_detections(det)
+        else:
+            det = sv.Detections.empty()
 
-            cx = (xyxy[0] + xyxy[2]) / 2
-            cy = (xyxy[1] + xyxy[3]) / 2
-            if track_id not in self.trails[cam_id]:
-                self.trails[cam_id][track_id] = []
-            self.trails[cam_id][track_id].append((cx, cy))
-            if len(self.trails[cam_id][track_id]) > 30:
-                self.trails[cam_id][track_id].pop(0)
+        # 标注和结果收集
+        boxes_data = []
+        display_scale = w / INFERENCE_SIZE if w > INFERENCE_SIZE else 1
 
-            self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
+        for i in range(len(det)):
+            x1, y1, x2, y2 = det.xyxy[i].tolist()
+            cx = (x1 + x2) / 2 * display_scale
+            cy = (y1 + y2) / 2 * display_scale
+            tid = int(det.tracker_id[i])
 
-            detection_list.append({
-                "track_id": track_id,
-                "class_name": class_name,
-                "confidence": conf,
-                "bbox": xyxy,
-            })
-        self._latest_detections[cam_id] = detection_list
+            # 轨迹
+            trail = self.trails[cam_id].setdefault(tid, [])
+            trail.append((round(cx, 1), round(cy, 1)))
+            if len(trail) > TRAIL_LEN:
+                trail.pop(0)
 
-        CameraDataStore().update(
-            camera_id=cam_id,
-            total_vehicle_count=len(detection_list),
-            boxes=[
-                BoundingBoxItem(
-                    track_id=int(d["track_id"]),
-                    class_name=str(d["class_name"]),
-                    confidence=float(d["confidence"]),
-                    bbox=list(d["bbox"]),
-                )
-                for d in detection_list
-            ],
-        )
-
-        frame = self.box_annotator.annotate(scene=frame, detections=detections)
-        frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
-
-        current_frame = self.frame_counts[cam_id]
-        stale_ids: list[int] = []
-        for track_id in list(self.trails[cam_id].keys()):
-            age = self.trail_age.get(cam_id, {}).get(track_id, 0)
-            if current_frame - age > TRAIL_MAX_AGE:
-                stale_ids.append(track_id)
-                continue
-            trail = self.trails[cam_id][track_id]
-            if len(trail) < 2:
-                continue
+            # 稳定化速度 = 轨迹总路径 / 时间
+            path_len = 0
             for j in range(1, len(trail)):
-                pt1 = (int(trail[j - 1][0]), int(trail[j - 1][1]))
-                pt2 = (int(trail[j][0]), int(trail[j][1]))
-                cv2.line(frame, pt1, pt2, (0, 255, 255), 1)
-        for track_id in stale_ids:
-            del self.trails[cam_id][track_id]
-            self.trail_age.get(cam_id, {}).pop(track_id, None)
+                dx = trail[j][0] - trail[j - 1][0]
+                dy = trail[j][1] - trail[j - 1][1]
+                path_len += math.sqrt(dx * dx + dy * dy)
+            time_span = len(trail) / DETECTION_FPS
+            speed = round(path_len / time_span, 1) if time_span > 0 else 0
 
+            # 每秒更新一次显示速度
+            self.frame_counts[cam_id] += 1
+            if self.frame_counts[cam_id] >= DETECTION_FPS:
+                self.frame_counts[cam_id] = 0
+            if self.frame_counts[cam_id] == 0:
+                self.speed_displays[cam_id][tid] = speed
+            display_speed = self.speed_displays[cam_id].get(tid, speed)
+
+            # 缩放坐标到原始帧空间用于绘制
+            x1_d = x1 * display_scale
+            y1_d = y1 * display_scale
+            x2_d = x2 * display_scale
+            y2_d = y2 * display_scale
+
+            cls_id = int(det.class_id[i])
+            cls_name = self.class_names.get(cls_id, "unknown")
+
+            boxes_data.append({
+                "x1": round(x1_d, 1),
+                "y1": round(y1_d, 1),
+                "x2": round(x2_d, 1),
+                "y2": round(y2_d, 1),
+                "label": cls_name,
+                "confidence": round(float(det.confidence[i]), 2),
+                "tracker_id": tid,
+                "speed": display_speed,
+            })
+
+            # 在帧上绘制
+            color = COLORS.get(cls_name, (0, 255, 0))
+            cv2.rectangle(frame, (int(x1_d), int(y1_d)), (int(x2_d), int(y2_d)), color, 2)
+
+            # 轨迹线
+            if len(trail) >= 2:
+                pts = np.array([(int(p[0]), int(p[1])) for p in trail], np.int32)
+                cv2.polylines(frame, [pts], False, color, 2)
+
+            # 标签
+            label_text = f"{cls_name} {display_speed}px/s"
+            (tw, th), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(frame, (int(x1_d), int(y1_d) - th - baseline - 4),
+                          (int(x1_d) + tw, int(y1_d)), color, -1)
+            cv2.putText(frame, label_text, (int(x1_d), int(y1_d) - baseline - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # 保存检测结果供外部获取
+        self._latest_detections[cam_id] = boxes_data
+
+        # FPS 统计
         self._frame_count += 1
         now = time.perf_counter()
         elapsed = now - self._last_time
@@ -149,15 +192,32 @@ class YOLODetector:
             self._fps = self._frame_count / elapsed
             self._frame_count = 0
             self._last_time = now
-
-        cv2.putText(
-            frame,
-            f"FPS: {self._fps:.1f}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
+        cv2.putText(frame, f"FPS: {self._fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         return frame
+
+    # ── 处理结果传输接口 ────────────────────────────────
+
+    def get_detections(self, cam_id: str = "default") -> dict:
+        """
+        处理结果传输接口:
+          获取指定摄像头最新一帧的检测结果 JSON。
+          返回: {"type": "detection", "cam": cam_id, "boxes": [...]}
+        """
+        boxes = self._latest_detections.get(cam_id, [])
+        return {
+            "type": "detection",
+            "cam": cam_id,
+            "boxes": boxes,
+        }
+
+    def get_all_detections(self) -> dict:
+        """
+        处理结果传输接口:
+          获取所有摄像头的最新检测结果。
+        """
+        return {
+            cam_id: self.get_detections(cam_id)
+            for cam_id in self._latest_detections
+        }

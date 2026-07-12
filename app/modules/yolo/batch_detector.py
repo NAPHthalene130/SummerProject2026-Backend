@@ -22,7 +22,18 @@ class BatchDetector:
     _instance: Optional["BatchDetector"] = None
     _instance_lock = threading.Lock()
 
-    def __new__(cls, model_path: str = "best.pt") -> "BatchDetector":
+    _default_model_path: str | None = None
+
+    @classmethod
+    def _get_default_model(cls) -> str:
+        if cls._default_model_path is None:
+            import os
+            cls._default_model_path = os.path.join(os.path.dirname(__file__), "best.pt")
+        return cls._default_model_path
+
+    def __new__(cls, model_path: str | None = None) -> "BatchDetector":
+        if model_path is None:
+            model_path = cls._get_default_model()
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
