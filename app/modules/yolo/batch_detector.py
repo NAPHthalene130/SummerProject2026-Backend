@@ -61,6 +61,9 @@ class BatchDetector:
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
 
+        self.line_zones: dict[str, sv.LineZone] = {}
+        self.zone_annotator = sv.LineZoneAnnotator(text_thickness=1, text_color=sv.Color.WHITE)
+
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -84,6 +87,16 @@ class BatchDetector:
         self.trails.pop(cam_id, None)
         self.trail_age.pop(cam_id, None)
         self.frame_counts.pop(cam_id, None)
+        self.line_zones.pop(cam_id, None)
+
+    def get_crossing_counts(self, cam_id: str) -> dict:
+        zone = self.line_zones.get(cam_id)
+        if zone is None:
+            return {"in_count": 0, "out_count": 0}
+        return {"in_count": zone.in_count, "out_count": zone.out_count}
+
+    def get_all_crossing_counts(self) -> dict[str, dict]:
+        return {cam_id: self.get_crossing_counts(cam_id) for cam_id in self.line_zones}
 
     def submit(self, cam_id: str, frame: np.ndarray) -> None:
         with self._pending_lock:
@@ -130,7 +143,7 @@ class BatchDetector:
             time.sleep(0.01)
 
     def _process_batch(self, cam_ids: list[str], frames: list[np.ndarray]) -> None:
-        results = self.model(frames, device=self.device, verbose=False)
+        results = self.model(frames, imgsz=640, device=self.device, verbose=False)
         for i, (cam_id, frame) in enumerate(zip(cam_ids, frames)):
             self._process_single(cam_id, frame, results[i])
 
@@ -150,6 +163,11 @@ class BatchDetector:
             self.trails[cam_id] = {}
             self.frame_counts[cam_id] = 0
 
+            h, w = frame.shape[:2]
+            line_start = sv.Point(0, int(h * 0.6))
+            line_end = sv.Point(w, int(h * 0.6))
+            self.line_zones[cam_id] = sv.LineZone(start=line_start, end=line_end)
+
         self.frame_counts[cam_id] += 1
 
         detections = sv.Detections.from_ultralytics(result)
@@ -158,6 +176,9 @@ class BatchDetector:
             detections = self.trackers[cam_id].update_with_detections(detections)
         else:
             detections.tracker_id = np.array([], dtype=int)
+
+        if cam_id in self.line_zones:
+            self.line_zones[cam_id].trigger(detections)
 
         labels: list[str] = []
         detection_list: list[dict[str, object]] = []
@@ -275,6 +296,9 @@ class BatchDetector:
 
         frame = self.box_annotator.annotate(scene=frame, detections=detections)
         frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
+
+        if cam_id in self.line_zones:
+            self.zone_annotator.annotate(frame=frame, line_counter=self.line_zones[cam_id])
 
         current_frame = self.frame_counts[cam_id]
         stale_ids: list[int] = []
