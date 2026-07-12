@@ -1,0 +1,13 @@
+# 云端部署摄像头配置
+# 中继运行在校园网机器上，地址替换为你的校园网机器公网 IP
+# 每路摄像头对应 http://中继IP:8888/cam-{id}
+cameras:
+  - id: "cam-01"
+    name: "苏州街-海淀南路"
+    url: "http://YOUR_RELAY_IP:8888/cam-01"
+  - id: "cam-02"
+    name: "海淀黄庄路口"
+    url: "http://YOUR_RELAY_IP:8888/cam-02"
+  - id: "cam-03"
+    name: "知春里路口"
+    url: "http://YOUR_RELAY_IP:8888/cam-03"

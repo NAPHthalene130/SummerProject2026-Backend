@@ -1,0 +1,13 @@
+# RTSP 中继配置
+# 从 SummerProject2026-Backend/config.yaml 自动读取，
+# 也可在此单独配置。此文件优先级高于后端 config.yaml。
+cameras:
+  - id: "cam-01"
+    name: "苏州街-海淀南路"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live1"
+  - id: "cam-02"
+    name: "海淀黄庄路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live2"
+  - id: "cam-03"
+    name: "知春里路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live3"
