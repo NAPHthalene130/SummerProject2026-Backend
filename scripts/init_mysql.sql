@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS `users` (
   `user_name` VARCHAR(255) NOT NULL,
   `user_password` VARCHAR(255) NOT NULL,
   `user_type` VARCHAR(64) NOT NULL,
+  `phone` VARCHAR(32) NULL,
+  `personnel_category` VARCHAR(64) NOT NULL DEFAULT 'traffic_police',
+  `site` VARCHAR(255) NULL,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`user_id`),
@@ -56,12 +59,28 @@ CREATE TABLE IF NOT EXISTS `work_orders` (
   `ai_suggestion` TEXT NULL,
   `scene_info` TEXT NULL,
   `completed_at` DATETIME NULL,
+  `required_category` VARCHAR(64) NOT NULL DEFAULT 'traffic_police',
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`work_order_id`),
   INDEX `idx_work_orders_rank` (`work_order_rank`),
   INDEX `idx_work_orders_status` (`work_order_status`),
   INDEX `idx_work_orders_stage` (`work_order_stage`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `mobile_reports` (
+  `report_id` INT NOT NULL AUTO_INCREMENT,
+  `reporter_user_id` INT NOT NULL,
+  `title` VARCHAR(255) NOT NULL,
+  `location` VARCHAR(255) NOT NULL,
+  `detail` TEXT NOT NULL,
+  `severity` VARCHAR(16) NOT NULL DEFAULT 'medium',
+  `event_type` VARCHAR(64) NOT NULL DEFAULT 'other',
+  `image_urls` TEXT NULL,
+  `status` VARCHAR(16) NOT NULL DEFAULT 'pending',
+  `work_order_id` INT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`report_id`), INDEX `idx_mobile_reports_status` (`status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `work_order_replies` (
