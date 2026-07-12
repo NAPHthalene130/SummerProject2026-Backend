@@ -64,6 +64,7 @@ class WorkOrderRepository:
         rank: int,
         image_url: str = "",
         scene_info: str = "",
+        required_category: str = "traffic_police",
     ) -> Optional[WorkOrderItemResponse]:
         event_id = f"evt_{camera_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         now = datetime.now()
@@ -75,13 +76,13 @@ class WorkOrderRepository:
                       event_id, camera_id, camera_name,
                       work_order_type, work_order_describe, work_order_img_url,
                       work_order_rank, work_order_stage, work_order_status,
-                      work_order_time, scene_info
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'unassigned', 0, %s, %s)
+                      work_order_time, scene_info, required_category
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'unassigned', 0, %s, %s, %s)
                     """,
                     (
                         event_id, camera_id, camera_name,
                         incident_type, description, image_url,
-                        rank, now, scene_info,
+                        rank, now, scene_info, required_category,
                     ),
                 )
                 work_order_id = cursor.lastrowid
@@ -90,13 +91,20 @@ class WorkOrderRepository:
         return None
 
     @staticmethod
-    def list_work_orders() -> list[WorkOrderItemResponse]:
+    def list_work_orders(user_id: Optional[int] = None) -> list[WorkOrderItemResponse]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
+                personnel_category = None
+                if user_id is not None:
+                    cursor.execute("SELECT personnel_category FROM users WHERE user_id=%s", (user_id,))
+                    user = cursor.fetchone()
+                    if user is None:
+                        return []
+                    personnel_category = user.get("personnel_category") or "traffic_police"
+                sql = """
                     SELECT
                       wo.*,
+                      ou.user_id AS assignee_user_id,
                       u.user_name AS assignee,
                       reply.work_order_reply_msg,
                       reply.work_order_reply_img_url,
@@ -112,9 +120,13 @@ class WorkOrderRepository:
                         ORDER BY r.work_order_reply_time DESC, r.work_order_reply_id DESC
                         LIMIT 1
                       )
-                    ORDER BY wo.work_order_time DESC, wo.work_order_id DESC
-                    """
-                )
+                """
+                args = ()
+                if personnel_category is not None:
+                    sql += " WHERE wo.required_category = %s"
+                    args = (personnel_category,)
+                sql += " ORDER BY wo.work_order_time DESC, wo.work_order_id DESC"
+                cursor.execute(sql, args)
                 return [WorkOrderRepository._row_to_response(row) for row in cursor.fetchall()]
 
     @staticmethod
@@ -126,6 +138,7 @@ class WorkOrderRepository:
                     """
                     SELECT
                       wo.*,
+                      ou.user_id AS assignee_user_id,
                       u.user_name AS assignee,
                       reply.work_order_reply_msg,
                       reply.work_order_reply_img_url,
@@ -158,6 +171,7 @@ class WorkOrderRepository:
                       u.user_id,
                       u.user_name,
                       u.user_type,
+                      u.personnel_category,
                       COUNT(
                         CASE
                           WHEN wo.work_order_status = 0
@@ -182,6 +196,7 @@ class WorkOrderRepository:
                             role=row["user_type"],
                             status="busy" if active_count else "idle",
                             distance_km=round(0.45 + (user_id % 5) * 0.35, 1),
+                            personnel_category=row.get("personnel_category") or "traffic_police",
                         )
                     )
                 return staff
@@ -191,6 +206,14 @@ class WorkOrderRepository:
         numeric_id = parse_work_order_id(work_order_id)
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT required_category FROM work_orders WHERE work_order_id=%s", (numeric_id,))
+                order_row = cursor.fetchone()
+                cursor.execute("SELECT personnel_category FROM users WHERE user_id=%s", (user_id,))
+                user_row = cursor.fetchone()
+                if not order_row or not user_row:
+                    return None
+                if (order_row.get("required_category") or "traffic_police") != (user_row.get("personnel_category") or "traffic_police"):
+                    raise ValueError("人员类别与工单要求不匹配")
                 cursor.execute(
                     """
                     INSERT INTO order_user (work_order_id, user_id, order_user_status)
@@ -214,6 +237,25 @@ class WorkOrderRepository:
                 )
 
         return WorkOrderRepository.get_work_order(str(numeric_id))
+
+    @staticmethod
+    def delete_staff(user_id: int) -> bool:
+        with mysql_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT user_id FROM users WHERE user_id=%s", (user_id,))
+                if cursor.fetchone() is None:
+                    return False
+                cursor.execute(
+                    """
+                    UPDATE work_orders wo
+                    JOIN order_user ou ON ou.work_order_id = wo.work_order_id
+                    SET wo.work_order_stage='unassigned', wo.work_order_status=0
+                    WHERE ou.user_id=%s AND wo.work_order_status=0
+                    """,
+                    (user_id,),
+                )
+                cursor.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+                return cursor.rowcount > 0
 
     @staticmethod
     def update_work_order_status(
@@ -292,6 +334,7 @@ class WorkOrderRepository:
             status=status,
             work_order_status=status_code,
             assignee=row.get("assignee"),
+            assignee_user_id=row.get("assignee_user_id"),
             description=row.get("work_order_describe") or "",
             ai_suggestion=row.get("ai_suggestion") or "建议联系现场人员确认情况，并按事件等级进行派发。",
             scene_images=split_images(row.get("work_order_img_url")),
@@ -299,4 +342,5 @@ class WorkOrderRepository:
             process_message=row.get("work_order_reply_msg"),
             process_images=process_images or None,
             completed_at=format_datetime(completed_at),
+            required_category=row.get("required_category") or "traffic_police",
         )

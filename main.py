@@ -44,6 +44,14 @@ logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    try:
+        from app.api.v1.mobile import ensure_schema
+        from app.database import mysql_connection
+        with mysql_connection() as connection:
+            with connection.cursor() as cursor:
+                ensure_schema(cursor)
+    except Exception as error:
+        logger.warning("Mobile work-order schema migration skipped: %s", error)
     cameras = CameraManager().get_all()
     logger.info("Loaded %d cameras from config", len(cameras))
     for cam in cameras:
