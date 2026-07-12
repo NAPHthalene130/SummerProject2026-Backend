@@ -14,13 +14,16 @@ staff_router = APIRouter()
 
 
 @work_orders_router.get("/", response_model=list[WorkOrderItemResponse])
-async def list_work_orders():
-    return WorkOrderRepository.list_work_orders()
+async def list_work_orders(user_id: int | None = None):
+    return WorkOrderRepository.list_work_orders(user_id)
 
 
 @work_orders_router.put("/{work_order_id}/dispatch", response_model=WorkOrderItemResponse)
 async def dispatch_work_order(work_order_id: str, request: WorkOrderDispatchRequest):
-    order = WorkOrderRepository.dispatch_work_order(work_order_id, request.user_id)
+    try:
+        order = WorkOrderRepository.dispatch_work_order(work_order_id, request.user_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if order is None:
         raise HTTPException(status_code=404, detail=f"Work order '{work_order_id}' not found")
     return order
@@ -42,3 +45,10 @@ async def update_work_order_status(work_order_id: str, request: WorkOrderStatusU
 @staff_router.get("/", response_model=list[StaffResponse])
 async def list_staff():
     return WorkOrderRepository.list_staff()
+
+
+@staff_router.delete("/{user_id}")
+async def delete_staff(user_id: int):
+    if not WorkOrderRepository.delete_staff(user_id):
+        raise HTTPException(status_code=404, detail="人员不存在")
+    return {"deleted": True, "user_id": user_id}

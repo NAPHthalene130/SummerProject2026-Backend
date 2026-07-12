@@ -40,6 +40,7 @@ class WorkOrderItemResponse(BaseModel):
     status: WorkOrderStage
     work_order_status: WorkOrderStatus
     assignee: Optional[str] = None
+    assignee_user_id: Optional[int] = None
     description: str
     ai_suggestion: str
     scene_images: list[str]
@@ -47,6 +48,7 @@ class WorkOrderItemResponse(BaseModel):
     process_message: Optional[str] = None
     process_images: Optional[list[str]] = None
     completed_at: Optional[str] = None
+    required_category: str = "traffic_police"
 
 
 class WorkOrderDispatchRequest(BaseModel):
