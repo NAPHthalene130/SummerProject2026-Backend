@@ -10,13 +10,32 @@ class UserNameAlreadyExistsError(ValueError):
 
 class UserRepository:
     @staticmethod
+    def ensure_schema(cursor) -> None:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_users (
+                admin_user_id INT NOT NULL AUTO_INCREMENT,
+                user_name VARCHAR(255) NOT NULL,
+                user_password VARCHAR(255) NOT NULL,
+                user_type VARCHAR(64) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (admin_user_id),
+                UNIQUE KEY uk_admin_users_user_name (user_name),
+                INDEX idx_admin_users_user_type (user_type)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+
+    @staticmethod
     def create_user(user_name: str, user_password: str, user_type: str) -> UserResponse:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                UserRepository.ensure_schema(cursor)
                 try:
                     cursor.execute(
                         """
-                        INSERT INTO users (user_name, user_password, user_type)
+                        INSERT INTO admin_users (user_name, user_password, user_type)
                         VALUES (%s, %s, %s)
                         """,
                         (user_name, user_password, user_type),
@@ -35,11 +54,12 @@ class UserRepository:
     def get_user_by_id(user_id: int) -> Optional[UserRecord]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                UserRepository.ensure_schema(cursor)
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_password, user_type
-                    FROM users
-                    WHERE user_id = %s
+                    SELECT admin_user_id AS user_id, user_name, user_password, user_type
+                    FROM admin_users
+                    WHERE admin_user_id = %s
                     """,
                     (user_id,),
                 )
@@ -50,10 +70,11 @@ class UserRepository:
     def get_user_by_name(user_name: str) -> Optional[UserRecord]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                UserRepository.ensure_schema(cursor)
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_password, user_type
-                    FROM users
+                    SELECT admin_user_id AS user_id, user_name, user_password, user_type
+                    FROM admin_users
                     WHERE user_name = %s
                     """,
                     (user_name,),
@@ -65,11 +86,12 @@ class UserRepository:
     def list_users() -> list[UserResponse]:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                UserRepository.ensure_schema(cursor)
                 cursor.execute(
                     """
-                    SELECT user_id, user_name, user_type
-                    FROM users
-                    ORDER BY user_id
+                    SELECT admin_user_id AS user_id, user_name, user_type
+                    FROM admin_users
+                    ORDER BY admin_user_id
                     """
                 )
                 return [UserResponse.model_validate(row) for row in cursor.fetchall()]
@@ -83,6 +105,7 @@ class UserRepository:
     ) -> UserResponse | None:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
+                UserRepository.ensure_schema(cursor)
                 fields = ["user_name = %s", "user_type = %s"]
                 values: list[object] = [user_name, user_type]
                 if user_password is not None:
@@ -92,7 +115,7 @@ class UserRepository:
 
                 try:
                     cursor.execute(
-                        f"UPDATE users SET {', '.join(fields)} WHERE user_id = %s",
+                        f"UPDATE admin_users SET {', '.join(fields)} WHERE admin_user_id = %s",
                         tuple(values),
                     )
                 except Exception as exc:
@@ -101,7 +124,7 @@ class UserRepository:
                     raise
 
                 cursor.execute(
-                    "SELECT user_id, user_name, user_type FROM users WHERE user_id = %s",
+                    "SELECT admin_user_id AS user_id, user_name, user_type FROM admin_users WHERE admin_user_id = %s",
                     (user_id,),
                 )
                 row = cursor.fetchone()
@@ -111,5 +134,6 @@ class UserRepository:
     def delete_user(user_id: int) -> bool:
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                UserRepository.ensure_schema(cursor)
+                cursor.execute("DELETE FROM admin_users WHERE admin_user_id = %s", (user_id,))
                 return cursor.rowcount > 0

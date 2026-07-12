@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from app.database import mysql_connection
 from app.models.mobile_report import MobileReportCreate, MobileReportResponse, ConvertReportRequest, RejectReportRequest
-from app.models.user import MobileUserLoginRequest, MobileUserRegisterRequest, MobileUserResponse
+from app.models.user import MobileUserLoginRequest, MobileUserRegisterRequest, MobileUserResponse, MobileUserUpdateRequest
 from app.repository.work_order_repository import WorkOrderRepository, format_work_order_code
 from app.utils.passwords import hash_password, is_password_hash, verify_password
 
@@ -129,6 +129,50 @@ def login(request: MobileUserLoginRequest):
             if not password_valid:
                 raise HTTPException(401, "手机号或密码错误")
             return user_response(row)
+
+
+@router.get("/mobile-users", response_model=list[MobileUserResponse])
+def list_mobile_users():
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_schema(cursor)
+            cursor.execute("SELECT * FROM users ORDER BY user_id")
+            return [user_response(row) for row in cursor.fetchall()]
+
+
+@router.put("/mobile-users/{user_id}", response_model=MobileUserResponse)
+def update_mobile_user(user_id: int, request: MobileUserUpdateRequest):
+    if request.personnel_category not in CATEGORIES:
+        raise HTTPException(400, "无效的人员类别")
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_schema(cursor)
+            cursor.execute("SELECT user_id FROM users WHERE phone=%s AND user_id<>%s", (request.phone, user_id))
+            if cursor.fetchone():
+                raise HTTPException(409, "手机号已被其他用户使用")
+            fields = ["user_name=%s", "phone=%s", "user_type=%s", "personnel_category=%s", "site=%s"]
+            values = [request.name, request.phone, CATEGORIES[request.personnel_category], request.personnel_category, request.site]
+            if request.password:
+                fields.append("user_password=%s")
+                values.append(hash_password(request.password))
+            values.append(user_id)
+            cursor.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id=%s", tuple(values))
+            if cursor.rowcount == 0:
+                cursor.execute("SELECT user_id FROM users WHERE user_id=%s", (user_id,))
+                if not cursor.fetchone():
+                    raise HTTPException(404, "手机端用户不存在")
+            cursor.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
+            return user_response(cursor.fetchone())
+
+
+@router.delete("/mobile-users/{user_id}", status_code=204)
+def delete_mobile_user(user_id: int):
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_schema(cursor)
+            cursor.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+            if cursor.rowcount == 0:
+                raise HTTPException(404, "手机端用户不存在")
 
 
 def report_response(row):

@@ -29,6 +29,18 @@ class UserCreateRequest(BaseModel):
         return value.strip()
 
 
+class UserLoginRequest(BaseModel):
+    user_name: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("user_name")
+    @classmethod
+    def normalize_user_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("用户名不能为空")
+        return value.strip()
+
+
 class UserUpdateRequest(BaseModel):
     user_name: str = Field(min_length=1, max_length=255)
     user_type: str = Field(min_length=1, max_length=64)
@@ -57,6 +69,14 @@ class MobileUserRegisterRequest(BaseModel):
     password: str
     personnel_category: str
     site: str = ""
+
+
+class MobileUserUpdateRequest(BaseModel):
+    name: str
+    phone: str
+    personnel_category: str
+    site: str = ""
+    password: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class MobileUserLoginRequest(BaseModel):
