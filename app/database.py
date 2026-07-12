@@ -20,6 +20,9 @@ def get_mysql_connection(use_database: bool = True) -> Any:
         "password": database_settings.password,
         "charset": database_settings.charset,
         "cursorclass": pymysql.cursors.DictCursor,
+        "connect_timeout": 5,
+        "read_timeout": 15,
+        "write_timeout": 15,
     }
     if use_database:
         connection_args["database"] = database_settings.name

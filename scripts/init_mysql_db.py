@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from app.utils.passwords import hash_password, is_password_hash
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT_DIR / "config.yaml"
@@ -431,18 +433,36 @@ def ensure_required_columns(cursor: Any) -> None:
 
 def seed_users(cursor: Any) -> int:
     for user in SEED_USERS:
+        user_id, user_name, password, user_type = user
         cursor.execute(
             """
             INSERT INTO users (user_id, user_name, user_password, user_type)
             VALUES (%s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
               user_name = VALUES(user_name),
-              user_password = VALUES(user_password),
               user_type = VALUES(user_type)
             """,
-            user,
+            (user_id, user_name, hash_password(password), user_type),
         )
     return len(SEED_USERS)
+
+
+def migrate_legacy_user_passwords(cursor: Any) -> int:
+    cursor.execute("SELECT user_id, user_password FROM users")
+    legacy_passwords: list[tuple[int, str]] = []
+    for row in cursor.fetchall():
+        if isinstance(row, dict):
+            user_id, password = row["user_id"], row["user_password"]
+        else:
+            user_id, password = row[0], row[1]
+        if not is_password_hash(str(password)):
+            legacy_passwords.append((int(user_id), str(password)))
+    for user_id, password in legacy_passwords:
+        cursor.execute(
+            "UPDATE users SET user_password = %s WHERE user_id = %s",
+            (hash_password(str(password)), user_id),
+        )
+    return len(legacy_passwords)
 
 
 def seed_work_orders(cursor: Any) -> int:
@@ -601,6 +621,7 @@ def main() -> None:
             migrate_work_order_status_schema(cursor)
             ensure_required_columns(cursor)
             user_count = seed_users(cursor)
+            migrated_password_count = migrate_legacy_user_passwords(cursor)
             work_order_count = seed_work_orders(cursor)
             order_user_count = seed_order_users(cursor)
             reply_count = seed_work_order_replies(cursor)
@@ -609,6 +630,7 @@ def main() -> None:
         print(
             f"Initialized MySQL database '{database_config['name']}' "
             f"and synced {camera_count} cameras, {user_count} users, "
+            f"{migrated_password_count} legacy passwords, "
             f"{work_order_count} work orders, {order_user_count} dispatches, "
             f"{reply_count} replies."
         )
