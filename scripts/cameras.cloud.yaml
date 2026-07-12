@@ -1,13 +1,46 @@
-# 云端部署摄像头配置
-# 中继运行在校园网机器上，地址替换为你的校园网机器公网 IP
-# 每路摄像头对应 http://中继IP:8888/cam-{id}
+# 云端部署摄像头配置（30路 → HTTP MJPEG 中继）
+# 中继运行在本地，地址：183.242.199.238:8888
+database:
+  host: "127.0.0.1"
+  port: 3306
+  username: "root"
+  password: "123456"
+  name: "summer_project_2026"
+  charset: "utf8mb4"
+
+llm:
+  url: "https://api.openai.com/v1"
+  api_key: "your_api_key_here"
+  model_name: "your_model_name_here"
+
 cameras:
-  - id: "cam-01"
-    name: "苏州街-海淀南路"
-    url: "http://YOUR_RELAY_IP:8888/cam-01"
-  - id: "cam-02"
-    name: "海淀黄庄路口"
-    url: "http://YOUR_RELAY_IP:8888/cam-02"
-  - id: "cam-03"
-    name: "知春里路口"
-    url: "http://YOUR_RELAY_IP:8888/cam-03"
+  - id: "cam-01"   name: "苏州街-海淀南路"     url: "http://183.242.199.238:8888/cam-01"   longitude: 116.30705   latitude: 39.972601
+  - id: "cam-02"   name: "海淀黄庄路口"         url: "http://183.242.199.238:8888/cam-02"   longitude: 116.3175    latitude: 39.973
+  - id: "cam-03"   name: "知春里路口"           url: "http://183.242.199.238:8888/cam-03"   longitude: 116.331     latitude: 39.973
+  - id: "cam-04"   name: "西土城路口"           url: "http://183.242.199.238:8888/cam-04"   longitude: 116.348     latitude: 39.973
+  - id: "cam-05"   name: "苏州街-丹棱街"        url: "http://183.242.199.238:8888/cam-05"   longitude: 116.307     latitude: 39.979
+  - id: "cam-06"   name: "中关村大街-丹棱街"    url: "http://183.242.199.238:8888/cam-06"   longitude: 116.3175    latitude: 39.979
+  - id: "cam-07"   name: "科学院南路路口"       url: "http://183.242.199.238:8888/cam-07"   longitude: 116.331     latitude: 39.979
+  - id: "cam-08"   name: "蓟门桥北"             url: "http://183.242.199.238:8888/cam-08"   longitude: 116.348     latitude: 39.979
+  - id: "cam-09"   name: "海淀桥"               url: "http://183.242.199.238:8888/cam-09"   longitude: 116.307     latitude: 39.984
+  - id: "cam-10"   name: "中关村一桥"           url: "http://183.242.199.238:8888/cam-10"   longitude: 116.3175    latitude: 39.984
+  - id: "cam-11"   name: "保福寺桥"             url: "http://183.242.199.238:8888/cam-11"   longitude: 116.331     latitude: 39.984
+  - id: "cam-12"   name: "学院桥"               url: "http://183.242.199.238:8888/cam-12"   longitude: 116.348     latitude: 39.984
+  - id: "cam-13"   name: "北大西门南"           url: "http://183.242.199.238:8888/cam-13"   longitude: 116.307     latitude: 39.988
+  - id: "cam-14"   name: "北大东门南"           url: "http://183.242.199.238:8888/cam-14"   longitude: 116.3175    latitude: 39.988
+  - id: "cam-15"   name: "清华科技园"           url: "http://183.242.199.238:8888/cam-15"   longitude: 116.331     latitude: 39.988
+  - id: "cam-16"   name: "北语东门"             url: "http://183.242.199.238:8888/cam-16"   longitude: 116.3485    latitude: 39.988
+  - id: "cam-17"   name: "圆明园南门西"         url: "http://183.242.199.238:8888/cam-17"   longitude: 116.307     latitude: 39.993
+  - id: "cam-18"   name: "北京大学东门"         url: "http://183.242.199.238:8888/cam-18"   longitude: 116.3175    latitude: 39.993
+  - id: "cam-19"   name: "五道口路口"           url: "http://183.242.199.238:8888/cam-19"   longitude: 116.331     latitude: 39.993
+  - id: "cam-20"   name: "六道口"               url: "http://183.242.199.238:8888/cam-20"   longitude: 116.348     latitude: 39.993
+  - id: "cam-21"   name: "清华西门西"           url: "http://183.242.199.238:8888/cam-21"   longitude: 116.307     latitude: 40.001
+  - id: "cam-22"   name: "清华大学西门"         url: "http://183.242.199.238:8888/cam-22"   longitude: 116.3175    latitude: 40.001
+  - id: "cam-23"   name: "清华大学东门"         url: "http://183.242.199.238:8888/cam-23"   longitude: 116.331     latitude: 40.001
+  - id: "cam-24"   name: "矿大东门"             url: "http://183.242.199.238:8888/cam-24"   longitude: 116.348     latitude: 40.001
+  - id: "cam-25"   name: "海淀南路中段"         url: "http://183.242.199.238:8888/cam-25"   longitude: 116.312     latitude: 39.973
+  - id: "cam-26"   name: "知春路中段"           url: "http://183.242.199.238:8888/cam-26"   longitude: 116.324     latitude: 39.973
+  - id: "cam-27"   name: "中关村大街中段"       url: "http://183.242.199.238:8888/cam-27"   longitude: 116.3175    latitude: 39.9815
+  - id: "cam-28"   name: "中关村东路中段"       url: "http://183.242.199.238:8888/cam-28"   longitude: 116.331     latitude: 39.9885
+  - id: "cam-29"   name: "成府路中段"           url: "http://183.242.199.238:8888/cam-29"   longitude: 116.324     latitude: 39.993
+  - id: "cam-30"   name: "清华东路西口"         url: "http://183.242.199.238:8888/cam-30"   longitude: 116.3395    latitude: 39.993
