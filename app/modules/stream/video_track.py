@@ -1,28 +1,35 @@
 import asyncio
 import time
 from fractions import Fraction
+from typing import TYPE_CHECKING, Optional
 
 import av
 import numpy as np
 
-from aiortc import VideoStreamTrack
-
 from app.modules.stream.camera_stream import CameraStream, TARGET_FPS, TEST_FRAME_H, TEST_FRAME_W
+
+try:
+    from aiortc import VideoStreamTrack
+    _HAS_AIORTC = True
+except Exception:
+    _HAS_AIORTC = False
 
 PTS_STEP = 90000 // TARGET_FPS
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 
-class ProcessedVideoTrack(VideoStreamTrack):
+class ProcessedVideoTrack:
     kind = "video"
 
     def __init__(self, camera_stream: CameraStream):
-        super().__init__()
+        if not _HAS_AIORTC:
+            raise RuntimeError("aiortc not available (cryptography issue)")
         self._stream = camera_stream
         self._pts = 0
         self._next_frame_time: float | None = None
         self._last_frame_id: int = -1
         self._first_frame = True
+        self._track = VideoStreamTrack()
 
     async def recv(self) -> av.VideoFrame:
         now = time.perf_counter()
