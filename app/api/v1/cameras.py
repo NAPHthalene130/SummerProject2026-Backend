@@ -1,6 +1,9 @@
+import asyncio
+import json
 from typing import List
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
 from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
 from app.modules.yolo import CameraDataStore
@@ -52,3 +55,19 @@ async def get_camera_boxes(camera_id: str):
             for b in data.boxes
         ]
     }
+
+
+@cameras_router.get("/boxes/stream")
+async def stream_all_boxes():
+    async def event_stream():
+        while True:
+            store = CameraDataStore()
+            payload = {}
+            for cam_id, data in store.get_all().items():
+                payload[cam_id] = [
+                    {"track_id": b.track_id, "class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox}
+                    for b in data.boxes
+                ]
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(0.1)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
