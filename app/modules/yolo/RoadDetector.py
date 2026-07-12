@@ -33,7 +33,7 @@ class LaneInfo:
 
 
 class RoadDetector:
-    def __init__(self, model_path: str = "yolo11n-seg.pt", known_lane_width_m: float = 3.5):
+    def __init__(self, model_path: str = "yolo11m-seg.pt", known_lane_width_m: float = 3.5):
         self.known_lane_width_m = known_lane_width_m
         self.model = YOLO(model_path)
         self.vp_x: Optional[float] = None
