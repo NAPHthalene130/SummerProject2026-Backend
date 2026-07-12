@@ -33,6 +33,7 @@ services:
       SP2026_DB_NAME: ${SP2026_DB_NAME:-summer_project_2026}
       SP2026_DB_CHARSET: utf8mb4
       SP2026_CORS_ORIGINS: '["*"]'
+      SP2026_ICE_SERVERS: ${SP2026_ICE_SERVERS:-stun:stun.l.google.com:19302}
     depends_on:
       mysql:
         condition: service_healthy
