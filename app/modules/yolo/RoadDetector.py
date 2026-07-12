@@ -110,20 +110,40 @@ class RoadDetector:
         a1, b1 = left_avg
         a2, b2 = right_avg
         denom = a1 - a2
-        if abs(denom) < 1e-6:
-            return False
-        vp_x = (b2 - b1) / denom
-        vp_y = a1 * vp_x + b1
-        if vp_y >= self.frame_h or vp_y < 0:
-            return False
-        self.vp_x = vp_x
-        self.vp_y = vp_y
-        rows = np.arange(self.frame_h, dtype=np.float32)
-        dy_from_vp = np.maximum(rows - vp_y, 1.0)
-        ref_dy = self.frame_h - vp_y
-        ref_pixel_width = abs(self.frame_w / 2 - vp_x) * 2
-        ref_m_per_pixel = self.known_lane_width_m / max(ref_pixel_width, 1.0)
-        self.scale_rows = ref_m_per_pixel * (dy_from_vp / ref_dy)
+
+        if abs(denom) >= 1e-6:
+            vp_x = (b2 - b1) / denom
+            vp_y = a1 * vp_x + b1
+            vp_in_frame = 0 <= vp_y < self.frame_h
+        else:
+            vp_x, vp_y = None, None
+            vp_in_frame = False
+
+        if vp_in_frame:
+            self.vp_x = vp_x
+            self.vp_y = vp_y
+            rows = np.arange(self.frame_h, dtype=np.float32)
+            dy_from_vp = np.maximum(rows - vp_y, 1.0)
+            ref_dy = self.frame_h - vp_y
+            ref_width = abs(self.frame_w / 2 - vp_x) * 2
+            ref_mpp = self.known_lane_width_m / max(ref_width, 1.0)
+            self.scale_rows = ref_mpp * (dy_from_vp / ref_dy)
+        else:
+            rows = np.arange(self.frame_h, dtype=np.float32)
+            def line_x(y, slope, intercept):
+                return (y - intercept) / slope if abs(slope) > 1e-6 else 0
+            top_y = min(max(0, int(min(p[1] for p in points))), self.frame_h - 1)
+            bot_y = self.frame_h - 1
+            top_width = abs(line_x(top_y, a1, b1) - line_x(top_y, a2, b2))
+            bot_width = abs(line_x(bot_y, a1, b1) - line_x(bot_y, a2, b2))
+            bot_width = max(bot_width, top_width)
+            ref_mpp = self.known_lane_width_m / max(bot_width, 1.0)
+            decay = max(top_width / bot_width, 0.1) if bot_width > 0 else 0.5
+            norm_y = (rows - top_y) / max(bot_y - top_y, 1.0)
+            self.scale_rows = ref_mpp * (decay + norm_y * (1.0 - decay))
+            self.vp_x = None
+            self.vp_y = None
+
         self.scale_cols = None
         return True
 
