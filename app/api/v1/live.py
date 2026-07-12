@@ -1,7 +1,7 @@
 import logging
 import os
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -58,7 +58,11 @@ async def webrtc_offer(camera_id: str, offer: OfferRequest):
     if stream is None:
         raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
 
-    pc = RTCPeerConnection() if not ICE_SERVERS else RTCPeerConnection(iceServers=ICE_SERVERS)
+    if ICE_SERVERS:
+        ice_servers = [RTCIceServer(urls=s["urls"], username=s.get("username"), credential=s.get("credential")) for s in ICE_SERVERS]
+        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
+    else:
+        pc = RTCPeerConnection()
     video_track = ProcessedVideoTrack(stream)
     pc.addTrack(video_track)
 
