@@ -1,3 +1,4 @@
+import collections
 import logging
 import threading
 import time
@@ -14,6 +15,8 @@ from app.modules.lstm.predictor import risk_predictor
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
 BATCH_SIZE = 8
+FLOW_WINDOW_SEC = 60
+ZONE_MARGIN = 0.15
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +64,10 @@ class BatchDetector:
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
 
-        self.line_zones: dict[str, sv.LineZone] = {}
-        self.zone_annotator = sv.LineZoneAnnotator(text_thickness=1, text_color=sv.Color.WHITE)
+        self.zone_rects: dict[str, tuple[int, int, int, int]] = {}
+        self._inside_zone: dict[str, dict[int, bool]] = {}
+        self._entry_events: dict[str, collections.deque] = {}
+        self._exit_events: dict[str, collections.deque] = {}
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -87,16 +92,32 @@ class BatchDetector:
         self.trails.pop(cam_id, None)
         self.trail_age.pop(cam_id, None)
         self.frame_counts.pop(cam_id, None)
-        self.line_zones.pop(cam_id, None)
+        self.zone_rects.pop(cam_id, None)
+        self._inside_zone.pop(cam_id, None)
+        self._entry_events.pop(cam_id, None)
+        self._exit_events.pop(cam_id, None)
 
-    def get_crossing_counts(self, cam_id: str) -> dict:
-        zone = self.line_zones.get(cam_id)
-        if zone is None:
-            return {"in_count": 0, "out_count": 0}
-        return {"in_count": zone.in_count, "out_count": zone.out_count}
+    def _prune_events(self, events: collections.deque, now: float) -> None:
+        while events and now - events[0][0] > FLOW_WINDOW_SEC:
+            events.popleft()
 
-    def get_all_crossing_counts(self) -> dict[str, dict]:
-        return {cam_id: self.get_crossing_counts(cam_id) for cam_id in self.line_zones}
+    def get_traffic_flow(self, cam_id: str) -> dict:
+        now = time.time()
+        entries = self._entry_events.get(cam_id)
+        exits = self._exit_events.get(cam_id)
+        if entries is None or exits is None:
+            return {"entry_count": 0, "exit_count": 0, "flow_per_min": 0.0}
+        self._prune_events(entries, now)
+        self._prune_events(exits, now)
+        total = len(entries) + len(exits)
+        return {
+            "entry_count": len(entries),
+            "exit_count": len(exits),
+            "flow_per_min": round(total * 60.0 / FLOW_WINDOW_SEC, 1),
+        }
+
+    def get_all_traffic_flow(self) -> dict[str, dict]:
+        return {cam_id: self.get_traffic_flow(cam_id) for cam_id in self.zone_rects}
 
     def submit(self, cam_id: str, frame: np.ndarray) -> None:
         with self._pending_lock:
@@ -162,13 +183,17 @@ class BatchDetector:
             self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
             self.trails[cam_id] = {}
             self.frame_counts[cam_id] = 0
+            self._inside_zone[cam_id] = {}
+            self._entry_events[cam_id] = collections.deque()
+            self._exit_events[cam_id] = collections.deque()
 
             h, w = frame.shape[:2]
-            line_start = sv.Point(0, int(h * 0.6))
-            line_end = sv.Point(w, int(h * 0.6))
-            self.line_zones[cam_id] = sv.LineZone(start=line_start, end=line_end)
+            margin_x = int(w * ZONE_MARGIN)
+            margin_y = int(h * ZONE_MARGIN)
+            self.zone_rects[cam_id] = (margin_x, margin_y, w - margin_x, h - margin_y)
 
         self.frame_counts[cam_id] += 1
+        now = time.time()
 
         detections = sv.Detections.from_ultralytics(result)
 
@@ -177,11 +202,10 @@ class BatchDetector:
         else:
             detections.tracker_id = np.array([], dtype=int)
 
-        if cam_id in self.line_zones:
-            self.line_zones[cam_id].trigger(detections)
-
         labels: list[str] = []
         detection_list: list[dict[str, object]] = []
+        zx1, zy1, zx2, zy2 = self.zone_rects[cam_id]
+        inside = self._inside_zone[cam_id]
         for i in range(len(detections)):
             if detections.tracker_id is not None and i < len(detections.tracker_id):
                 track_id = int(detections.tracker_id[i])
@@ -204,6 +228,14 @@ class BatchDetector:
                 self.trails[cam_id][track_id].pop(0)
 
             self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
+
+            was_inside = inside.get(track_id, False)
+            is_inside = zx1 < cx < zx2 and zy1 < cy < zy2
+            if not was_inside and is_inside:
+                self._entry_events[cam_id].append((now, track_id))
+            elif was_inside and not is_inside:
+                self._exit_events[cam_id].append((now, track_id))
+            inside[track_id] = is_inside
 
             detection_list.append({
                 "track_id": track_id,
@@ -297,8 +329,22 @@ class BatchDetector:
         frame = self.box_annotator.annotate(scene=frame, detections=detections)
         frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
 
-        if cam_id in self.line_zones:
-            self.zone_annotator.annotate(frame=frame, line_counter=self.line_zones[cam_id])
+        if cam_id in self.zone_rects:
+            self._prune_events(self._entry_events[cam_id], now)
+            self._prune_events(self._exit_events[cam_id], now)
+            zx1, zy1, zx2, zy2 = self.zone_rects[cam_id]
+            cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (0, 255, 255), 2)
+            cv2.putText(frame, "COUNT ZONE", (zx1 + 5, zy1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            flow = self.get_traffic_flow(cam_id)
+            info = [
+                f"Entry: {flow['entry_count']}",
+                f"Exit: {flow['exit_count']}",
+                f"Flow: {flow['flow_per_min']}/min",
+            ]
+            for j, line in enumerate(info):
+                cv2.putText(frame, line, (zx1 + 5, zy2 - 10 - j * 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         current_frame = self.frame_counts[cam_id]
         stale_ids: list[int] = []
@@ -317,6 +363,7 @@ class BatchDetector:
         for track_id in stale_ids:
             del self.trails[cam_id][track_id]
             self.trail_age.get(cam_id, {}).pop(track_id, None)
+            inside.pop(track_id, None)
 
         stream = self._streams.get(cam_id)
         if stream is not None:
