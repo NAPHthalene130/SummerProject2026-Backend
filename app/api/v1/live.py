@@ -3,12 +3,17 @@ import os
 from urllib.request import urlopen
 
 import httpx
-from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.modules.stream import ProcessedVideoTrack, StreamManager
+
+try:
+    from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
+    _HAS_AIORTC = True
+except Exception:
+    _HAS_AIORTC = False
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,8 @@ async def camera_mjpeg(camera_id: str):
 
 @live_router.post("/{camera_id}/offer", response_model=AnswerResponse)
 async def webrtc_offer(camera_id: str, offer: OfferRequest):
+    if not _HAS_AIORTC:
+        raise HTTPException(status_code=501, detail="WebRTC not available (aiortc/cryptography)")
     manager = StreamManager()
     stream = manager.subscribe(camera_id)
     if stream is None:
