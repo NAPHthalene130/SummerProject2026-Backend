@@ -1,8 +1,11 @@
 import logging
 import os
+from urllib.request import urlopen
 
+import httpx
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.modules.stream import ProcessedVideoTrack, StreamManager
@@ -49,6 +52,24 @@ def _parse_ice_servers(raw: str | None) -> list[dict]:
 
 
 ICE_SERVERS = _parse_ice_servers(os.getenv("SP2026_ICE_SERVERS"))
+
+
+RELAY_BASE = os.getenv("SP2026_RELAY_URL", "http://127.0.0.1:8889")
+
+
+@live_router.get("/{camera_id}/mjpeg")
+async def camera_mjpeg(camera_id: str):
+    relay_url = f"{RELAY_BASE}/{camera_id}"
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            req = client.build_request("GET", relay_url)
+            resp = await client.send(req, stream=True)
+            return StreamingResponse(
+                resp.aiter_bytes(),
+                media_type=resp.headers.get("content-type", "multipart/x-mixed-replace; boundary=frame"),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Relay error: {e}")
 
 
 @live_router.post("/{camera_id}/offer", response_model=AnswerResponse)
