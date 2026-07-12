@@ -216,12 +216,21 @@ class WorkOrderRepository:
         numeric_id = parse_work_order_id(work_order_id)
         with mysql_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT required_category FROM work_orders WHERE work_order_id=%s", (numeric_id,))
+                cursor.execute(
+                    "SELECT work_order_stage, required_category FROM work_orders "
+                    "WHERE work_order_id = %s FOR UPDATE",
+                    (numeric_id,),
+                )
                 order_row = cursor.fetchone()
                 cursor.execute("SELECT personnel_category FROM users WHERE user_id=%s", (user_id,))
                 user_row = cursor.fetchone()
                 if not order_row or not user_row:
                     return None
+                if order_row.get("work_order_stage") != "unassigned":
+                    raise ValueError(
+                        f"工单当前状态为 '{order_row.get('work_order_stage')}',"
+                        f"仅未派发(unassigned)工单可派发"
+                    )
                 if (order_row.get("required_category") or "traffic_police") != (user_row.get("personnel_category") or "traffic_police"):
                     raise ValueError("人员类别与工单要求不匹配")
                 cursor.execute(

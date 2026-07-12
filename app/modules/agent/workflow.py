@@ -69,6 +69,27 @@ class AgentWorkflow:
                 "event_time": wo.event_time,
                 "completed_at": wo.completed_at,
                 "recommended_actions": AgentWorkflow._build_action_plan(wo.status, wo.event_level),
+                "recommended_actions_basis": {
+                    "source_type": "internal_rule",
+                    "rule": "stage_and_event_level_action_plan",
+                    "verified_against_regulation": False,
+                },
+                "evidence": {
+                    "source_type": "database",
+                    "source": "work_order_repository",
+                    "record_id": str(wo.work_order_id),
+                    "verified_fields": [
+                        "status", "event_level", "description", "scene_info", "assignee",
+                        "process_message", "completed_at", "required_category",
+                    ],
+                },
+                "file_evidence": {
+                    "scene_image_urls": list(wo.scene_images or []),
+                    "process_image_urls": list(wo.process_images or []),
+                    "content_verified": False,
+                    "existence_verified": False,
+                    "limitation": "仅核验数据库记录的URL/路径,未读取或识别文件内容。",
+                },
                 "available_staff": {
                     "matching_staff": [
                         {
@@ -147,6 +168,14 @@ class AgentWorkflow:
                     "by_level": by_level,
                     "high_priority_unresolved": unresolved_high,
                     "medium_priority_unresolved": unresolved_medium[:10],
+                    "evidence": {
+                        "source_type": "database",
+                        "source": "work_order_repository",
+                        "verified_fields": [
+                            "summary", "by_stage", "by_level",
+                            "high_priority_unresolved", "medium_priority_unresolved",
+                        ],
+                    },
                 },
             )
         except Exception as exc:
@@ -200,6 +229,16 @@ class AgentWorkflow:
                         }
                         for idx, s in enumerate(top_k_candidates)
                     ],
+                    "evidence": {
+                        "source_type": "database",
+                        "source": "work_order_repository",
+                        "record_id": str(wo.work_order_id),
+                        "verified_fields": [
+                            "required_category", "candidate.personnel_category",
+                            "candidate.work_order_count", "candidate.distance_km",
+                        ],
+                    },
+                    "ranking_basis": "personnel_category匹配后,按work_order_count升序、distance_km升序排序。",
                 },
             )
         except Exception as exc:

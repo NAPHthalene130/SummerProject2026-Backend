@@ -72,6 +72,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "query_work_order_stats": "查询工单统计数据,按状态和等级汇总",
     "suggest_handling": "分析工单并基于当前状态生成分阶段处置建议",
     "dispatch_work_order": "将工单派发给指定人员",
+    "batch_dispatch_unassigned": "批量派发:自动将所有未派发工单按类别匹配最优人员并派发",
     "answer_general_question": "回答交通管理法规和处置流程等通用问题",
 }
 

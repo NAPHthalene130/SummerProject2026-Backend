@@ -1,7 +1,12 @@
+import base64
 import json
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
+from openai import OpenAI
+
+from app.config import llm_settings
 from app.database import mysql_connection
 from app.repository.work_order_repository import (
     WorkOrderRepository,
@@ -10,6 +15,81 @@ from app.repository.work_order_repository import (
 )
 
 logger = logging.getLogger(__name__)
+_rag_manager_instance: Any = None
+_vlm_client: Optional[OpenAI] = None
+
+_IMAGE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "orderImg"
+
+
+def _get_vlm_client() -> OpenAI:
+    global _vlm_client
+    if _vlm_client is None:
+        _vlm_client = OpenAI(
+            base_url=llm_settings.url,
+            api_key=llm_settings.api_key,
+        )
+    return _vlm_client
+
+
+def _image_url_to_path(url: str) -> Optional[Path]:
+    """Convert a DB-stored image URL to an absolute filesystem path."""
+    if not url:
+        return None
+    filename = url.rsplit("/", 1)[-1] if "/" in url else url
+    filepath = _IMAGE_DIR / filename
+    return filepath if filepath.is_file() else None
+
+
+def _load_images_base64(image_urls: list[str]) -> list[dict[str, str]]:
+    """Load images from disk and return as base64 data URIs for VLM input."""
+    images: list[dict[str, str]] = []
+    for url in image_urls:
+        path = _image_url_to_path(url)
+        if path is None:
+            images.append({"error": f"图片文件不存在: {url}"})
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+            ext = path.suffix.lower().lstrip(".")
+            mime = f"image/{ext}" if ext in ("jpg", "jpeg", "png", "webp") else "image/jpeg"
+            images.append({"data": f"data:{mime};base64,{data}", "filename": path.name})
+        except Exception as exc:
+            logger.warning("加载图片失败 %s: %s", url, exc)
+            images.append({"error": f"图片读取失败: {url}"})
+    return images
+
+
+def _call_vlm_with_images(images: list[dict[str, str]], prompt: str) -> str:
+    """Send images + text prompt to the VLM and return the analysis result."""
+    client = _get_vlm_client()
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for img in images:
+        if "data" in img:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": img["data"]},
+            })
+
+    try:
+        response = client.chat.completions.create(
+            model=llm_settings.model_name,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        return response.choices[0].message.content or "图片分析无返回内容"
+    except Exception as exc:
+        logger.warning("VLM图片分析调用失败: %s", exc)
+        return f"图片分析调用失败: {exc}"
+
+
+def _search_regulations(query: str) -> dict[str, list[dict[str, str]]]:
+    global _rag_manager_instance
+    if _rag_manager_instance is None:
+        from app.modules.agent.rag.rag_manager import RagManager
+        _rag_manager_instance = RagManager()
+    return _rag_manager_instance.search_rag(query)
 
 
 def _parse_work_order_id(work_order_id: str) -> int:
@@ -72,29 +152,15 @@ def search_work_orders(work_order_id: str) -> str:
                 cursor.execute(
                     """
                     SELECT
-                        wo.work_order_id,
-                        wo.event_id,
-                        wo.camera_id,
-                        wo.camera_name,
-                        wo.segment_id,
-                        wo.segment_name,
-                        wo.monitor_address,
-                        wo.work_order_type,
-                        wo.work_order_describe,
-                        wo.work_order_img_url,
-                        wo.work_order_rank,
-                        wo.work_order_time,
-                        wo.work_order_stage,
-                        wo.work_order_status,
-                        wo.ai_suggestion,
-                        wo.scene_info,
-                        wo.completed_at,
-                        ou.order_user_id,
-                        ou.user_id AS assignee_user_id,
-                        ou.order_user_time,
-                        ou.order_user_status,
-                        u.user_name AS assignee_name,
-                        u.user_type AS assignee_type
+                        wo.work_order_id, wo.event_id, wo.camera_id, wo.camera_name,
+                        wo.segment_id, wo.segment_name, wo.monitor_address,
+                        wo.work_order_type, wo.work_order_describe, wo.work_order_img_url,
+                        wo.work_order_rank, wo.work_order_time,
+                        wo.work_order_stage, wo.work_order_status,
+                        wo.ai_suggestion, wo.scene_info, wo.completed_at,
+                        ou.order_user_id, ou.user_id AS assignee_user_id,
+                        ou.order_user_time, ou.order_user_status,
+                        u.user_name AS assignee_name, u.user_type AS assignee_type
                     FROM work_orders wo
                     LEFT JOIN order_user ou ON wo.work_order_id = ou.work_order_id
                     LEFT JOIN users u ON ou.user_id = u.user_id
@@ -112,8 +178,6 @@ def search_work_orders(work_order_id: str) -> str:
             "event_id": row.get("event_id"),
             "camera_id": row.get("camera_id"),
             "camera_name": row.get("camera_name"),
-            "segment_id": row.get("segment_id"),
-            "segment_name": row.get("segment_name"),
             "monitor_address": row.get("monitor_address"),
             "work_order_type": row.get("work_order_type"),
             "work_order_describe": row.get("work_order_describe"),
@@ -125,20 +189,12 @@ def search_work_orders(work_order_id: str) -> str:
             "ai_suggestion": row.get("ai_suggestion"),
             "scene_info": row.get("scene_info"),
             "completed_at": _serialize_datetime(row.get("completed_at")),
+            "assignee_name": row.get("assignee_name"),
+            "assignee_user_id": row.get("assignee_user_id"),
+            "assignee_type": row.get("assignee_type"),
         }
 
-        assignment: Optional[dict[str, Any]] = None
-        if row.get("assignee_user_id") is not None:
-            assignment = {
-                "order_user_id": row.get("order_user_id"),
-                "user_id": row.get("assignee_user_id"),
-                "user_name": row.get("assignee_name"),
-                "user_type": row.get("assignee_type"),
-                "order_user_time": _serialize_datetime(row.get("order_user_time")),
-                "order_user_status": row.get("order_user_status"),
-            }
-
-        return json.dumps({"work_order": work_order, "assignment": assignment}, ensure_ascii=False)
+        return json.dumps(work_order, ensure_ascii=False)
 
     except Exception as exc:
         logger.exception("search_work_orders 查询失败")
@@ -173,7 +229,9 @@ def query_work_orders(
 
     items = []
     for wo in work_orders:
-        items.append(_format_work_order_for_agent(wo))
+        item = _format_work_order_for_agent(wo)
+        item["scene_image_count"] = len(wo.scene_images)
+        items.append(item)
 
     stats = {
         "total": len(items),
@@ -202,20 +260,16 @@ def get_work_order_detail(work_order_id: str) -> str:
         return json.dumps({"error": f"未找到工单: {work_order_id}", "data": None}, ensure_ascii=False)
 
     detail = _format_work_order_for_agent(wo)
-    detail["scene_images"] = wo.scene_images
-    detail["process_images"] = wo.process_images
+    detail["scene_image_count"] = len(wo.scene_images)
+    detail["process_image_count"] = len(wo.process_images or [])
+    detail["has_process_message"] = bool(wo.process_message)
+    detail["has_completed_at"] = bool(wo.completed_at)
 
-    reply_message = None
-    if wo.process_message:
-        reply_message = wo.process_message
-
-    detail["reply_message"] = reply_message
     return json.dumps(detail, ensure_ascii=False)
 
 
 def query_staff() -> str:
     """查询所有可派发人员信息。
-    返回人员列表,包括姓名、角色、当前未处理工单数(work_order_count)、人员类别、工作描述等。
     work_order_count越小表示人员负载越低,更适合派发新工单。"""
     try:
         staff_list = WorkOrderRepository.list_staff()
@@ -224,26 +278,20 @@ def query_staff() -> str:
         return json.dumps({"error": f"查询人员失败: {exc}", "data": None}, ensure_ascii=False)
 
     sorted_staff = sorted(staff_list, key=lambda s: s.work_order_count)
-    avg_workload = round(sum(s.work_order_count for s in sorted_staff) / len(sorted_staff), 1) if sorted_staff else 0
-
     items = [_format_staff_for_agent(s) for s in sorted_staff]
+
     return json.dumps(
         {
             "staff": items,
-            "summary": {
-                "total": len(items),
-                "avg_work_order_count": avg_workload,
-                "min_work_order_count": sorted_staff[0].work_order_count if sorted_staff else 0,
-                "max_work_order_count": sorted_staff[-1].work_order_count if sorted_staff else 0,
-            },
+            "total": len(items),
+            "avg_workload": round(sum(s.work_order_count for s in sorted_staff) / len(sorted_staff), 1) if sorted_staff else 0,
         },
         ensure_ascii=False,
     )
 
 
 def query_work_order_stats() -> str:
-    """查询工单统计数据,按状态和等级汇总。
-    返回各状态工单数量及各等级分布,用于宏观决策参考。"""
+    """查询工单统计数据,按状态和等级汇总。"""
     try:
         work_orders = WorkOrderRepository.list_work_orders()
     except Exception as exc:
@@ -260,23 +308,29 @@ def query_work_order_stats() -> str:
         lv = wo.event_level
         by_level[lv] = by_level.get(lv, 0) + 1
         if lv == "high" and s not in ("completed", "ignored"):
-            high_unresolved.append(_format_work_order_for_agent(wo))
+            high_unresolved.append({
+                "id": wo.work_order_id,
+                "type": wo.accident_info,
+                "level": wo.event_level,
+                "stage": s,
+                "location": wo.camera_name,
+            })
 
     return json.dumps(
         {
             "total": len(work_orders),
             "by_stage": by_stage,
             "by_level": by_level,
-            "unresolved_high_priority": high_unresolved[:5],
+            "high_priority_unresolved": high_unresolved[:5],
         },
         ensure_ascii=False,
     )
 
 
 def suggest_handling(work_order_id: str) -> str:
-    """分析指定工单并生成处置建议。
-    基于工单状态、事故等级、现场信息和处置经验给出专业的分阶段建议。
-    当前状态不同,建议侧重不同:未派发→推荐人员和优先级,待处理→处置步骤,处理中→升级条件,已完成/忽略→复盘要点。"""
+    """分析指定工单并生成处置建议上下文(JSON)。
+    未派发→推荐人员与优先级,待处理→处置步骤,处理中→升级条件,已完成/忽略→复盘。
+    自动加载工单关联的现场照片,调用视觉模型分析画面内容,将分析结果一并返回。"""
     try:
         wo = WorkOrderRepository.get_work_order(work_order_id)
     except Exception as exc:
@@ -286,61 +340,81 @@ def suggest_handling(work_order_id: str) -> str:
     if wo is None:
         return json.dumps({"error": f"未找到工单: {work_order_id}", "data": None}, ensure_ascii=False)
 
-    detail = _format_work_order_for_agent(wo)
-    status = detail["status"]
-    level = detail["event_level"]
-    accident_type = detail["accident_info"]
-    scene_info = detail["scene_info"]
-    description = detail["description"]
-
-    rag_hint = ""
+    rag_articles: list[dict[str, str]] = []
     try:
-        from app.modules.agent.rag.rag_manager import rag_manager as rm
-        search_query = f"{accident_type} {description}"
-        rag_result = rm.search_rag(search_query)
+        search_query = f"{wo.accident_info} {wo.description}"
+        rag_result = _search_regulations(search_query)
         if rag_result:
-            articles = []
             for law_title, items in rag_result.items():
                 for item in items[:3]:
-                    articles.append(f"[{item.get('chapter', '')}] {item.get('describe', '')}")
-            if articles:
-                rag_hint = "\n相关法规参考:\n" + "\n".join(articles)
+                    rag_articles.append({
+                        "law": law_title,
+                        "article": item.get("chapter", ""),
+                        "excerpt": item.get("describe", "")[:120],
+                    })
     except Exception as rag_exc:
         logger.warning("suggest_handling RAG检索失败: %s", rag_exc)
 
-    suggestion_context = {
-        "work_order_id": wo.work_order_id,
-        "accident_type": accident_type,
-        "event_level": level,
-        "current_stage": status,
-        "description": description,
-        "scene_info": scene_info,
-        "location": detail["camera_name"],
-        "monitor_address": detail["monitor_address"],
-        "assignee": detail["assignee"],
-        "existing_ai_suggestion": detail["ai_suggestion"],
-        "process_message": detail.get("process_message"),
-        "rag_reference": rag_hint,
-    }
+    image_analysis = ""
+    scene_images = list(getattr(wo, "scene_images", None) or [])
+    if scene_images:
+        loaded = _load_images_base64(scene_images)
+        valid_images = [img for img in loaded if "data" in img]
+        if valid_images:
+            img_prompt = (
+                "你是交通监控图片分析助手。请用3-5句中文描述以下现场照片中的关键信息,"
+                "重点观察: 1)车辆数量、位置和状态(是否有碰撞变形); "
+                "2)道路占用情况(哪几条车道被阻断); "
+                "3)现场是否有人员活动(围观、施救、摆放警示标志); "
+                "4)天气和光照条件。"
+                "只描述你能清晰看到的内容,不确定的请说明'画面中无法确认'。"
+            )
+            image_analysis = _call_vlm_with_images(valid_images, img_prompt)
 
     stage_guidance = {
-        "unassigned": "工单尚未派发,建议从优先级评估、推荐人员类别、预估响应时效三个维度给出建议。",
-        "pending": "工单已派发待处理,建议从处置步骤、现场注意事项、需要协调的资源三个维度给出建议。",
-        "processing": "工单正在处理中,建议从当前进展评估、是否需要升级、结案标准三个维度给出建议。",
-        "completed": "工单已完成,建议从处置复盘、经验总结、预防措施三个维度给出建议。",
-        "ignored": "工单已被忽略,建议从重新激活条件、历史原因分析、后续监控三个维度给出建议。",
+        "unassigned": "工单尚未派发,从优先级、推荐人员类别、响应时效给出建议",
+        "pending": "工单已派发待处理,从处置步骤、现场注意事项、协调资源给出建议",
+        "processing": "工单处理中,从进展评估、升级条件、结案标准给出建议",
+        "completed": "工单已完成,总结处置经验",
+        "ignored": "工单已忽略,评估重新激活条件",
     }
 
-    suggestion_context["stage_guidance"] = stage_guidance.get(status, "请综合工单信息给出通用处置建议。")
-
-    return json.dumps(suggestion_context, ensure_ascii=False)
+    return json.dumps({
+        "work_order_id": wo.work_order_id,
+        "accident_type": wo.accident_info,
+        "event_level": wo.event_level,
+        "current_stage": wo.status,
+        "description": wo.description,
+        "scene_info": wo.scene_info,
+        "location": f"{wo.camera_name} ({wo.monitor_address})",
+        "assignee": wo.assignee,
+        "process_message": wo.process_message,
+        "scene_image_count": len(scene_images),
+        "image_analysis": image_analysis,
+        "stage_guidance": stage_guidance.get(wo.status, "综合工单信息给出通用建议"),
+        "rag_references": rag_articles,
+    }, ensure_ascii=False)
 
 
 def dispatch_work_order(work_order_id: str, user_id: int) -> str:
     """将指定工单派发给指定人员。
+    派发前先从数据库重新获取工单最新状态,确认仍为unassigned后再执行派发。
     work_order_id: 工单编号,如 WO-20260709-001
-    user_id: 人员数字ID,从query_staff查询获得。
-    派发前会校验工单状态和人员类别匹配,派发后工单状态变更为pending。"""
+    user_id: 人员数字ID,从query_staff查询获得。"""
+    latest = WorkOrderRepository.get_work_order(work_order_id)
+    if latest is None:
+        return json.dumps({"error": f"工单不存在: {work_order_id}", "data": None}, ensure_ascii=False)
+
+    if latest.status != "unassigned":
+        return json.dumps(
+            {
+                "error": f"工单当前状态为 '{latest.status}',"
+                f"仅未派发(unassigned)状态可派发。可能已被他人派发,请刷新后重试。",
+                "data": {"work_order_id": latest.work_order_id, "status": latest.status, "assignee": latest.assignee},
+            },
+            ensure_ascii=False,
+        )
+
     try:
         result = WorkOrderRepository.dispatch_work_order(work_order_id, user_id)
     except ValueError as exc:
@@ -352,35 +426,122 @@ def dispatch_work_order(work_order_id: str, user_id: int) -> str:
     if result is None:
         return json.dumps({"error": "派发失败,工单或人员不存在", "data": None}, ensure_ascii=False)
 
-    dispatch_result = _format_work_order_for_agent(result)
-    dispatch_result["message"] = f"工单 {work_order_id} 已成功派发,当前状态: {result.status}"
-    return json.dumps(dispatch_result, ensure_ascii=False)
+    return json.dumps({
+        "work_order_id": result.work_order_id,
+        "status": result.status,
+        "assignee": result.assignee,
+        "message": f"工单 {work_order_id} 已成功派发至 {result.assignee},当前状态: {result.status}",
+    }, ensure_ascii=False)
+
+
+def batch_dispatch_unassigned() -> str:
+    """批量派发:将所有未派发(unassigned)工单自动匹配同类别负载最低的人员并派发。
+    无需参数,自动完成查询→匹配→派发全流程,返回每条工单的派发结果摘要。"""
+    all_orders = WorkOrderRepository.list_work_orders()
+    unassigned = [wo for wo in all_orders if wo.status == "unassigned"]
+
+    if not unassigned:
+        return json.dumps({"message": "当前没有未派发工单", "total": 0}, ensure_ascii=False)
+
+    staff_list = WorkOrderRepository.list_staff()
+    if not staff_list:
+        return json.dumps({"error": "无可派发人员", "total_unassigned": len(unassigned)}, ensure_ascii=False)
+
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for wo in unassigned:
+        category = wo.required_category or "traffic_police"
+        candidates = [s for s in staff_list if s.personnel_category == category]
+        if not candidates:
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "type": wo.accident_info,
+                "level": wo.event_level,
+                "required_category": category,
+                "result": "skipped",
+                "reason": f"无{category}类别可用人员",
+            })
+            skip_count += 1
+            continue
+
+        best = min(candidates, key=lambda s: s.work_order_count)
+        try:
+            dispatch_result = WorkOrderRepository.dispatch_work_order(
+                str(wo.work_order_id), int(best.id)
+            )
+        except ValueError as exc:
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "type": wo.accident_info,
+                "level": wo.event_level,
+                "required_category": category,
+                "result": "failed",
+                "reason": str(exc),
+            })
+            fail_count += 1
+            continue
+        except Exception as exc:
+            logger.exception("batch_dispatch 派发异常 work_order=%s", wo.work_order_id)
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "result": "failed",
+                "reason": str(exc),
+            })
+            fail_count += 1
+            continue
+
+        if dispatch_result is None:
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "result": "failed",
+                "reason": "派发返回空结果",
+            })
+            fail_count += 1
+        else:
+            results.append({
+                "work_order_id": dispatch_result.work_order_id,
+                "type": dispatch_result.accident_info,
+                "level": dispatch_result.event_level,
+                "assigned_to": dispatch_result.assignee,
+                "staff_id": int(best.id),
+                "workload": best.work_order_count,
+                "result": "success",
+            })
+            success_count += 1
+
+    return json.dumps({
+        "total_unassigned": len(unassigned),
+        "success": success_count,
+        "skipped": skip_count,
+        "failed": fail_count,
+        "details": results,
+    }, ensure_ascii=False)
 
 
 def answer_general_question(question: str) -> str:
-    """回答关于交通管理、道路运营、工单处置流程、法规条例等通用问题。
-    支持:交通事故分类标准、工单等级划分规则、派发流程说明、处置规范等。
-    问题示例: 什么是工单等级、如何判断事故严重程度、派发流程是怎样的。"""
-    rag_articles: list[str] = []
+    """回答交通管理法规、工单处置流程等通用问题。
+    从法规知识库检索相关条款作为回答依据。"""
+    rag_articles: list[dict[str, str]] = []
     try:
-        from app.modules.agent.rag.rag_manager import rag_manager as rm
-        rag_result = rm.search_rag(question)
+        rag_result = _search_regulations(question)
         for law_title, items in rag_result.items():
             for item in items:
-                rag_articles.append(
-                    f"【{law_title}】{item.get('chapter', '')}: {item.get('describe', '')}"
-                )
+                rag_articles.append({
+                    "law": law_title,
+                    "article": item.get("chapter", ""),
+                    "excerpt": item.get("describe", "")[:150],
+                })
     except Exception as rag_exc:
         logger.warning("answer_general_question RAG检索失败: %s", rag_exc)
 
-    return json.dumps(
-        {
-            "question": question,
-            "rag_references": rag_articles,
-            "hint": "请基于以上法规条款和交通管理知识,用简洁专业的语言回答用户问题。如无匹配法规,请基于通用知识回答并说明信息来源。",
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps({
+        "question": question,
+        "rag_references": rag_articles,
+        "note": "仅将rag_references中实际返回的条款作为依据,无匹配时说明知识库未检索到",
+    }, ensure_ascii=False)
 
 
 TOOLS = [
@@ -391,5 +552,6 @@ TOOLS = [
     query_work_order_stats,
     suggest_handling,
     dispatch_work_order,
+    batch_dispatch_unassigned,
     answer_general_question,
 ]

@@ -18,6 +18,11 @@ from app.modules.lstm.model import TrafficRiskLSTM
 
 logger = logging.getLogger(__name__)
 
+_GPU_AVAILABLE = torch.cuda.is_available()
+if _GPU_AVAILABLE:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
 
 class RiskPredictor:
     _instance: Optional["RiskPredictor"] = None
@@ -42,8 +47,11 @@ class RiskPredictor:
             return
 
         self.device = torch.device(device)
+        self._use_amp = self.device.type == "cuda"
+
         self.model = TrafficRiskLSTM(input_size=8, hidden_size=64, num_layers=2)
-        self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
+        state_dict = torch.load(weights_path, map_location=self.device)
+        self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
 
@@ -55,13 +63,21 @@ class RiskPredictor:
         self._risk_lock = threading.Lock()
         self._initialized = True
 
+        gpu_mem = ""
+        if self._use_amp:
+            gpu_mem = (
+                f", gpu_mem_allocated={torch.cuda.memory_allocated() / 1024**2:.1f}MB, "
+                f"gpu_mem_reserved={torch.cuda.memory_reserved() / 1024**2:.1f}MB"
+            )
         logger.info(
-            "RiskPredictor initialized: model=%s scaler=%s device=%s window=%ds/%ds",
+            "RiskPredictor initialized: model=%s scaler=%s device=%s window=%ds/%ds amp=%s%s",
             weights_path,
             scaler_path or "defaults",
             device,
             WINDOW_SEC,
             STEP_SEC,
+            self._use_amp,
+            gpu_mem,
         )
 
     def process_frame(
@@ -107,7 +123,11 @@ class RiskPredictor:
     def _infer(self, sequence: np.ndarray, camera_id: str) -> Optional[float]:
         tensor = torch.from_numpy(sequence).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            prediction = self.model(tensor)
+            if self._use_amp:
+                with torch.cuda.amp.autocast():
+                    prediction = self.model(tensor)
+            else:
+                prediction = self.model(tensor)
         risk = float(prediction.item())
 
         with self._risk_lock:
