@@ -25,7 +25,7 @@ class BatchDetector:
     _instance: Optional["BatchDetector"] = None
     _instance_lock = threading.Lock()
 
-    def __new__(cls, model_path: str = "best.pt") -> "BatchDetector":
+    def __new__(cls, model_path: str = "yolo11m.pt") -> "BatchDetector":
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
