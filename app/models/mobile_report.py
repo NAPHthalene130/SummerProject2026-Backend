@@ -21,7 +21,13 @@ class MobileReportResponse(MobileReportCreate):
     status: ReportStatus
     created_at: str
     work_order_id: Optional[str] = None
+    review_message: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 class ConvertReportRequest(BaseModel):
     required_category: str
+
+
+class RejectReportRequest(BaseModel):
+    review_message: str

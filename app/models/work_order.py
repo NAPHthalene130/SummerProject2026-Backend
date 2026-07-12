@@ -49,6 +49,9 @@ class WorkOrderItemResponse(BaseModel):
     process_images: Optional[list[str]] = None
     completed_at: Optional[str] = None
     required_category: str = "traffic_police"
+    feedback_review_status: Literal["none", "pending", "approved", "rejected"] = "none"
+    feedback_requested_status: Optional[Literal["completed", "ignored"]] = None
+    feedback_review_message: Optional[str] = None
 
 
 class WorkOrderDispatchRequest(BaseModel):
@@ -59,3 +62,15 @@ class WorkOrderStatusUpdateRequest(BaseModel):
     status: WorkOrderStage
     process_message: Optional[str] = None
     process_image_url: Optional[str] = None
+
+
+class MobileFeedbackRequest(BaseModel):
+    user_id: int
+    status: Literal["completed", "ignored"]
+    process_message: str
+    process_image_url: Optional[str] = None
+
+
+class FeedbackReviewRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+    review_message: Optional[str] = None

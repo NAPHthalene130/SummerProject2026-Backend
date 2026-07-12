@@ -53,6 +53,11 @@ class TrafficAnalyst:
         with open(prompt_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    def _load_verification_prompt(self) -> str:
+        prompt_path = Path(__file__).resolve().parent / "prompts" / "traffic_incident_verification.md"
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+
     def _init_client(self) -> AsyncOpenAI:
         return AsyncOpenAI(
             base_url=llm_settings.url,
@@ -63,6 +68,7 @@ class TrafficAnalyst:
         if self._task is not None and not self._task.done():
             return
         self._prompt = self._load_prompt()
+        self._verification_prompt: str = self._load_verification_prompt()
         self._client = self._init_client()
         self._camera_tasks = {}
         self._next_analysis = {}
@@ -223,9 +229,30 @@ class TrafficAnalyst:
             self._log_cleared_incidents(camera_id, cleared_types)
 
             if store.is_incident_active(camera_id, incident.incident_type):
-                # The same camera and incident type identify one active event.
-                # Observing it again refreshes its lifecycle without a duplicate.
                 return
+
+            verified, verify_reason = await self._verify_incident(
+                camera_id=camera_id,
+                images=images,
+                incident=incident,
+            )
+
+            if not verified:
+                logger.warning(
+                    "Camera %s incident REJECTED by secondary verification: %s (type=%s, confidence=%.3f)",
+                    camera_id,
+                    verify_reason,
+                    incident.incident_type,
+                    incident.confidence,
+                )
+                self._clear_frame_buffer(camera_id)
+                return
+
+            logger.info(
+                "Camera %s incident CONFIRMED by secondary verification: %s",
+                camera_id,
+                verify_reason,
+            )
 
             image_path = await asyncio.to_thread(self._save_incident_frame, frame, camera_id)
             work_order_created = await asyncio.to_thread(
@@ -235,9 +262,8 @@ class TrafficAnalyst:
                 image_path,
             )
             if work_order_created:
-                # Only mark the incident active after the database insert
-                # succeeds. A failed insert is retried on the next result.
                 store.activate_incident(camera_id, incident.incident_type)
+                self._clear_frame_buffer(camera_id)
             else:
                 logger.warning(
                     "Camera %s incident remains pending because work order creation failed",
@@ -362,6 +388,110 @@ class TrafficAnalyst:
         cv2.imwrite(str(filepath), frame)
         logger.info("Incident frame saved: %s", filepath)
         return f"/orderImg/{filename}"
+
+    async def _verify_incident(
+        self,
+        camera_id: str,
+        images: list[str],
+        incident: TrafficIncidentResult,
+    ) -> tuple[bool, str]:
+        """对初次检测到的事故进行严格的二次校验。
+
+        返回 (confirmed, reason) 二元组。
+        """
+        try:
+            detection_info = (
+                f"初次检测结果:\n"
+                f"- 事故类型: {incident.incident_type}\n"
+                f"- 置信度: {incident.confidence:.3f}\n"
+                f"- 描述: {incident.description}\n"
+                f"- 摄像头ID: {camera_id}\n"
+            )
+            raw_response = await self._call_verification(images, detection_info)
+            confirmed, reason = self._parse_verification_response(camera_id, raw_response)
+            return confirmed, reason
+        except Exception as exc:
+            logger.exception("Secondary verification failed for camera %s", camera_id)
+            return False, f"二次校验调用异常: {exc}"
+
+    async def _call_verification(self, images_b64: list[str], detection_info: str) -> str:
+        content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"{self._verification_prompt}\n\n"
+                    f"---\n\n"
+                    f"以下是初次检测模型的判定结果，请对其进行严格的独立复核：\n\n"
+                    f"{detection_info}\n\n"
+                    f"---\n\n"
+                    f"以下是从该摄像头采集的连续 {len(images_b64)} 帧画面"
+                    f"（按时间顺序，最早的在最前面，最新的在最后面）。"
+                    f"请逐一检查每一帧，判断事故是否确实成立：\n\n"
+                ),
+            },
+        ]
+        for img in images_b64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img}"},
+            })
+        response = await self._client.chat.completions.create(
+            model=llm_settings.model_name,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=800,
+            temperature=0.05,
+        )
+        return response.choices[0].message.content or "{}"
+
+    def _parse_verification_response(self, camera_id: str, raw_response: str) -> tuple[bool, str]:
+        text = raw_response.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Failed to parse verification JSON for camera %s: %s",
+                camera_id,
+                raw_response[:200],
+            )
+            return False, f"校验结果JSON解析失败,原始响应前200字符: {raw_response[:200]}"
+
+        if not isinstance(data, dict):
+            return False, "校验结果格式无效(非JSON对象)"
+
+        raw_confirmed = data.get("confirmed", False)
+        if isinstance(raw_confirmed, bool):
+            confirmed = raw_confirmed
+        elif isinstance(raw_confirmed, str):
+            confirmed = raw_confirmed.strip().lower() == "true"
+        else:
+            confirmed = False
+
+        reason = str(data.get("reason", "")).strip()
+        if not reason:
+            reason = "校验模型未提供裁定理由"
+
+        logger.info(
+            "Camera %s verification result: confirmed=%s, reason=%s",
+            camera_id,
+            confirmed,
+            reason,
+        )
+        return confirmed, reason
+
+    def _clear_frame_buffer(self, camera_id: str) -> None:
+        """清除指定摄像头的帧缓冲,释放内存。"""
+        if camera_id in self._frame_buffer:
+            buffer_len = len(self._frame_buffer[camera_id])
+            del self._frame_buffer[camera_id]
+            logger.debug(
+                "Camera %s frame buffer cleared (%d frames released)",
+                camera_id,
+                buffer_len,
+            )
 
     def _create_work_order(self, camera_id: str, incident: TrafficIncidentResult, image_path: str) -> bool:
         cam_config = CameraManager().get_by_id(camera_id)
