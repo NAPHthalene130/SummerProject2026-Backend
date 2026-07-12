@@ -6,3 +6,12 @@ class CameraResponse(BaseModel):
     name: str
     longitude: float
     latitude: float
+
+
+class CameraStatsItem(BaseModel):
+    camera_id: str
+    total_vehicle_count: int
+
+
+class CameraStatsResponse(BaseModel):
+    cameras: list[CameraStatsItem]
