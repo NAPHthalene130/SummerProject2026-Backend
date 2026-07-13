@@ -237,7 +237,7 @@ class BatchDetector:
                 order = order[remaining + 1]
             detections = detections[keep]
 
-        raw_boxes = [list(b) for b in (detections.xyxy or [])]
+        raw_boxes = [list(b) for b in (detections.xyxy.tolist() if detections.xyxy is not None else [])]
 
         if len(detections) > 0:
             detections = self.trackers[cam_id].update_with_detections(detections)

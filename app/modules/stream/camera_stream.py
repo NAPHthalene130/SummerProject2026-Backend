@@ -45,7 +45,7 @@ class CameraStream:
 
     @property
     def has_display_viewers(self) -> bool:
-        return self._subscriber_count > 1
+        return self._subscriber_count > 0
 
     def add_subscriber(self) -> None:
         self._subscriber_count += 1
