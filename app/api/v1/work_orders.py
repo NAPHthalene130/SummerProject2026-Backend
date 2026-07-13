@@ -5,6 +5,8 @@ from app.models.work_order import (
     WorkOrderDispatchRequest,
     WorkOrderItemResponse,
     WorkOrderStatusUpdateRequest,
+    MobileFeedbackRequest,
+    FeedbackReviewRequest,
 )
 from app.repository.work_order_repository import WorkOrderRepository
 
@@ -42,13 +44,29 @@ async def update_work_order_status(work_order_id: str, request: WorkOrderStatusU
     return order
 
 
+@work_orders_router.post("/{work_order_id}/mobile-feedback", response_model=WorkOrderItemResponse)
+async def submit_mobile_feedback(work_order_id: str, request: MobileFeedbackRequest):
+    try:
+        order = WorkOrderRepository.submit_mobile_feedback(
+            work_order_id, request.user_id, request.status, request.process_message, request.process_image_url,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if order is None:
+        raise HTTPException(status_code=404, detail="工单或用户不存在")
+    return order
+
+
+@work_orders_router.post("/{work_order_id}/feedback-review", response_model=WorkOrderItemResponse)
+async def review_mobile_feedback(work_order_id: str, request: FeedbackReviewRequest):
+    order = WorkOrderRepository.review_mobile_feedback(work_order_id, request.decision, request.review_message)
+    if order is None:
+        raise HTTPException(status_code=404, detail="没有待审核的处置结果")
+    return order
+
+
 @staff_router.get("/", response_model=list[StaffResponse])
 async def list_staff():
     return WorkOrderRepository.list_staff()
 
 
-@staff_router.delete("/{user_id}")
-async def delete_staff(user_id: int):
-    if not WorkOrderRepository.delete_staff(user_id):
-        raise HTTPException(status_code=404, detail="人员不存在")
-    return {"deleted": True, "user_id": user_id}

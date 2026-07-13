@@ -5,7 +5,7 @@ from typing import Any, List
 from urllib.parse import quote_plus
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 
@@ -46,6 +46,15 @@ class LLMSettings(BaseModel):
     url: str = "https://api.openai.com/v1"
     api_key: str = "your_api_key_here"
     model_name: str = "your_model_name_here"
+
+
+class EmbeddingSettings(BaseModel):
+    url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: str = "your_api_key_here"
+    model_name: str = "text-embedding-v4"
+    dimensions: int = Field(default=1024, gt=0)
+    concurrency: int = Field(default=10, ge=1)
+    timeout: float = Field(default=60.0, gt=0)
 
 
 class Settings(BaseSettings):
@@ -104,3 +113,27 @@ def get_llm_settings() -> LLMSettings:
 
 
 llm_settings = get_llm_settings()
+
+
+@lru_cache
+def get_embedding_settings() -> EmbeddingSettings:
+    data = dict(load_yaml_config().get("embedding", {}))
+    environment_values = {
+        "url": os.getenv("SP2026_EMBEDDING_URL"),
+        "api_key": os.getenv("SP2026_EMBEDDING_API_KEY"),
+        "model_name": os.getenv("SP2026_EMBEDDING_MODEL_NAME"),
+        "dimensions": os.getenv("SP2026_EMBEDDING_DIMENSIONS"),
+        "concurrency": os.getenv("SP2026_EMBEDDING_CONCURRENCY"),
+        "timeout": os.getenv("SP2026_EMBEDDING_TIMEOUT"),
+    }
+    data.update(
+        {
+            key: value
+            for key, value in environment_values.items()
+            if value not in {None, ""}
+        }
+    )
+    return EmbeddingSettings.model_validate(data)
+
+
+embedding_settings = get_embedding_settings()

@@ -41,6 +41,18 @@ CREATE TABLE IF NOT EXISTS `users` (
   INDEX `idx_users_user_type` (`user_type`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `admin_users` (
+  `admin_user_id` INT NOT NULL AUTO_INCREMENT,
+  `user_name` VARCHAR(255) NOT NULL,
+  `user_password` VARCHAR(255) NOT NULL,
+  `user_type` VARCHAR(64) NOT NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`admin_user_id`),
+  UNIQUE KEY `uk_admin_users_user_name` (`user_name`),
+  INDEX `idx_admin_users_user_type` (`user_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `work_orders` (
   `work_order_id` INT NOT NULL AUTO_INCREMENT,
   `event_id` VARCHAR(64) NULL,
