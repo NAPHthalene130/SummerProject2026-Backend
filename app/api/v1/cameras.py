@@ -3,6 +3,7 @@ from typing import List
 from fastapi import APIRouter
 
 from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
+from app.modules.stream import StreamManager
 from app.modules.yolo import CameraDataStore
 from app.utils.camera_manager import CameraManager
 
@@ -33,3 +34,9 @@ async def get_camera_stats():
             total_vehicle_count=data.total_vehicle_count,
         ))
     return CameraStatsResponse(cameras=items)
+
+
+@cameras_router.get("/stream-health")
+async def get_stream_health():
+    """Runtime RTSP/YOLO diagnostics for locating an unhealthy feed or bottleneck."""
+    return StreamManager().pipeline_health()
