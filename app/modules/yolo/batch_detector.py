@@ -249,6 +249,25 @@ class BatchDetector:
                 "bbox": xyxy,
             })
 
+        lane_positions = []
+        for d in detection_list:
+            bbox = d.get("bbox", [0, 0, 0, 0])
+            cx = (bbox[0] + bbox[2]) / 2
+            lane_positions.append(cx)
+        lane_count = 0
+        if len(lane_positions) >= 3:
+            lane_positions.sort()
+            gaps = [lane_positions[i+1] - lane_positions[i] for i in range(len(lane_positions)-1)]
+            mean_gap = np.mean(gaps) if gaps else 0
+            if mean_gap > 5:
+                clusters = 1
+                for g in gaps:
+                    if g > mean_gap * 0.6:
+                        clusters += 1
+                lane_count = max(1, min(clusters, 8))
+        else:
+            lane_count = max(1, len(lane_positions))
+
         CameraDataStore().update(
             camera_id=cam_id,
             total_vehicle_count=len(detection_list),
@@ -261,6 +280,7 @@ class BatchDetector:
                 )
                 for d in detection_list
             ],
+            lane_count=lane_count,
         )
 
         timestamp_ms = int(time.time() * 1000)
@@ -308,15 +328,10 @@ class BatchDetector:
                     ts = np.array([p[2] for p in pts])
                     dt_total = ts[-1] - ts[0]
                     if dt_total > 0.3:
-                        dx_total = xs[-1] - xs[0]
-                        if abs(dx_total) > 5:
-                            try:
-                                coeffs = np.polyfit(ts, xs, 1)
-                                speed_px = abs(coeffs[0])
-                            except np.linalg.LinAlgError:
-                                speed_px = abs(dx_total) / dt_total
-                        else:
-                            speed_px = abs(dx_total) / max(dt_total, 0.01)
+                        total_dist = 0.0
+                        for j in range(1, len(pts)):
+                            total_dist += np.sqrt((xs[j] - xs[j-1])**2 + (ys[j] - ys[j-1])**2)
+                        speed_px = total_dist / dt_total
                         vel = speed_px * self.PIXEL_TO_METER
                         vel_kmh = vel * 3.6
                         if stable > 0 and abs(vel_kmh - stable) < 5:

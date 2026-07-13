@@ -14,10 +14,11 @@ class BoundingBoxItem:
 
 
 class CameraData:
-    def __init__(self, camera_id: str, total_vehicle_count: int, boxes: list[BoundingBoxItem]):
+    def __init__(self, camera_id: str, total_vehicle_count: int, boxes: list[BoundingBoxItem], lane_count: int = 0):
         self.camera_id = camera_id
         self.total_vehicle_count = total_vehicle_count
         self.boxes = boxes
+        self.lane_count = lane_count
 
 
 class TrafficIncidentResult:
@@ -83,11 +84,13 @@ class CameraDataStore:
         camera_id: str,
         total_vehicle_count: int,
         boxes: list[BoundingBoxItem],
+        lane_count: int = 0,
     ) -> None:
         self._data[camera_id] = CameraData(
             camera_id=camera_id,
             total_vehicle_count=total_vehicle_count,
             boxes=boxes,
+            lane_count=lane_count,
         )
 
     def get_by_camera_id(self, camera_id: str) -> Optional[CameraData]:
