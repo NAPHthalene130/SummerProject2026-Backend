@@ -30,8 +30,10 @@ class FrameProcessor:
         self.frame_count = 0
         self.frame_h = 480
         self.frame_w = 640
-        self.line_zone: sv.LineZone | None = None
-        self.zone_annotator = sv.LineZoneAnnotator(text_thickness=1, text_color=sv.Color.WHITE)
+        self.zx1 = self.zy1 = self.zx2 = self.zy2 = 0
+        self._inside_zone: dict[int, bool] = {}
+        self._entry_events: list = []
+        self._exit_events: list = []
         self._prev_positions: dict[int, dict] = {}
         self._trajectories: dict[int, list] = {}
         self._speed_last_update: dict[int, float] = {}
@@ -41,7 +43,10 @@ class FrameProcessor:
 
     def init_zone(self, h: int, w: int, margin: float = 0.15):
         self.frame_h, self.frame_w = h, w
-        self.line_zone = sv.LineZone(start=sv.Point(0, int(h * 0.6)), end=sv.Point(w, int(h * 0.6)))
+        self.zx1 = int(w * margin)
+        self.zy1 = int(h * margin)
+        self.zx2 = w - self.zx1
+        self.zy2 = h - self.zy1
 
     def _get_color(self, track_id: int) -> sv.Color:
         if track_id not in self._track_colors:
@@ -107,6 +112,14 @@ class FrameProcessor:
                 detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
                 speed_map[tid] = vel_kmh
 
+                was_in = self._inside_zone.get(tid, False)
+                is_in = self.zx1 < cx < self.zx2 and self.zy1 < cy < self.zy2
+                if not was_in and is_in:
+                    self._entry_events.append((now, tid))
+                elif was_in and not is_in:
+                    self._exit_events.append((now, tid))
+                self._inside_zone[tid] = is_in
+
         self._update_store(detection_list, speed_map)
         stats = self._compute_stats(detection_list, speed_map)
 
@@ -126,10 +139,14 @@ class FrameProcessor:
             frame = label_annotator.annotate(scene=frame, detections=filtered, labels=labels)
             frame = self.trace_annotator.annotate(scene=frame, detections=filtered)
 
-        # LineZone进出计数
-        if self.line_zone is not None and len(filtered) > 0:
-            self.line_zone.trigger(filtered)
-            self.zone_annotator.annotate(frame=frame, line_counter=self.line_zone)
+        # 绘制矩形检测区+进出计数
+        now_t = time.time()
+        self._prune_events(now_t)
+        cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 2)
+        cv2.putText(frame, "COUNT ZONE", (self.zx1 + 5, self.zy1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        flow = self.get_traffic_flow()
+        for j, txt in enumerate([f"Entry:{flow['entry_count']}", f"Exit:{flow['exit_count']}", f"Flow:{flow['flow_per_min']}/min"]):
+            cv2.putText(frame, txt, (self.zx1 + 5, self.zy2 - 10 - j * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         self._cleanup_trails()
         return detection_list, frame, stats
@@ -251,11 +268,18 @@ class FrameProcessor:
         return {"avg_speed": float(np.mean(speeds)) if speeds else 0.0,
                 "max_speed": float(np.max(speeds)) if speeds else 0.0}
 
+    def _prune_events(self, now: float):
+        cutoff = now - 60
+        self._entry_events = [(t, tid) for t, tid in self._entry_events if t > cutoff]
+        self._exit_events = [(t, tid) for t, tid in self._exit_events if t > cutoff]
+
     def get_traffic_flow(self) -> dict:
-        if self.line_zone is None:
-            return {"entry_count": 0, "exit_count": 0, "flow_per_min": 0.0}
-        return {"entry_count": self.line_zone.in_count, "exit_count": self.line_zone.out_count,
-                "flow_per_min": round(self.line_zone.in_count + self.line_zone.out_count, 1)}
+        now = time.time()
+        self._prune_events(now)
+        ec = len(self._entry_events)
+        xc = len(self._exit_events)
+        total = ec + xc
+        return {"entry_count": ec, "exit_count": xc, "flow_per_min": round(total, 1)}
 
     def _cleanup_trails(self):
         stale = [tid for tid, age in self.trail_age.items() if self.frame_count - age > TRAIL_MAX_AGE]
