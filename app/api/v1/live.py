@@ -64,10 +64,6 @@ RELAY_BASE = os.getenv("SP2026_RELAY_URL", "http://127.0.0.1:8889")
 
 @live_router.get("/{camera_id}/mjpeg")
 async def camera_mjpeg(camera_id: str):
-    # 按需订阅摄像头（触发 CameraStream + BatchDetector）
-    manager = StreamManager()
-    stream = manager.subscribe(camera_id)
-    
     relay_url = f"{RELAY_BASE}/{camera_id}"
     
     for attempt in range(3):
@@ -82,8 +78,6 @@ async def camera_mjpeg(camera_id: str):
                             yield chunk
                     except Exception:
                         pass
-                    finally:
-                        manager.unsubscribe(camera_id)
                 
                 return StreamingResponse(
                     proxy_stream(),
@@ -94,7 +88,6 @@ async def camera_mjpeg(camera_id: str):
                 import asyncio
                 await asyncio.sleep(1)
                 continue
-            manager.unsubscribe(camera_id)
             raise HTTPException(status_code=502, detail="Relay connection failed")
 
 
