@@ -1,6 +1,9 @@
+import asyncio
+import json
 from typing import List
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
 from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
 from app.modules.stream import StreamManager
@@ -40,3 +43,40 @@ async def get_camera_stats():
 async def get_stream_health():
     """Runtime RTSP/YOLO diagnostics for locating an unhealthy feed or bottleneck."""
     return StreamManager().pipeline_health()
+
+
+@cameras_router.get("/boxes/stream")
+async def stream_all_boxes():
+    """Push lightweight YOLO metadata independently of the WebRTC video path."""
+
+    async def event_stream():
+        while True:
+            payload: dict[str, object] = {}
+            frame_metadata: dict[str, dict[str, float | int]] = {}
+            for camera_id, data in CameraDataStore().get_all().items():
+                payload[camera_id] = [
+                    {
+                        "track_id": box.track_id,
+                        "class_name": box.class_name,
+                        "confidence": box.confidence,
+                        "bbox": box.bbox,
+                    }
+                    for box in data.boxes
+                ]
+                frame_metadata[camera_id] = {
+                    "width": data.frame_width,
+                    "height": data.frame_height,
+                    "updated_at": data.updated_at,
+                }
+            payload["_frames"] = frame_metadata
+            yield f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -18,6 +18,8 @@ TEST_FRAME_W = 640
 TEST_FRAME_H = 480
 TARGET_FPS = settings.STREAM_FPS
 FRAME_INTERVAL = 1.0 / TARGET_FPS
+VIEWER_DETECTION_INTERVAL = 1.0 / settings.YOLO_VIEWER_FPS
+BACKGROUND_DETECTION_INTERVAL = 1.0 / settings.YOLO_BACKGROUND_FPS
 
 OBJ_CENTER_X = 0
 
@@ -55,6 +57,7 @@ class CameraStream:
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
         self._subscriber_count = 0
+        self._viewer_count = 0
         self._subscriber_lock = threading.Lock()
         self._frame_ready = threading.Event()
         self._stop_event = threading.Event()
@@ -80,6 +83,7 @@ class CameraStream:
         self._read_failure_count = 0
         self._decode_frame_count = 0
         self._published_frame_count = 0
+        self._detection_submit_count = 0
         self._decode_fps = 0.0
         self._decode_window_started_at = time.perf_counter()
         self._decode_window_frames = 0
@@ -92,6 +96,15 @@ class CameraStream:
     def subscriber_count(self) -> int:
         with self._subscriber_lock:
             return self._subscriber_count
+
+    @property
+    def viewer_count(self) -> int:
+        with self._subscriber_lock:
+            return self._viewer_count
+
+    @property
+    def has_display_viewers(self) -> bool:
+        return self.viewer_count > 0
 
     @property
     def connection_state(self) -> str:
@@ -107,16 +120,25 @@ class CameraStream:
                 and time.perf_counter() - self._last_frame_at <= RTSP_STALE_FRAME_SECONDS
             )
 
-    def add_subscriber(self) -> None:
+    def add_subscriber(self, *, viewer: bool = False) -> None:
         with self._subscriber_lock:
             self._subscriber_count += 1
+            if viewer:
+                self._viewer_count += 1
             should_start = self._subscriber_count == 1
         if should_start:
             self.start()
 
-    def remove_subscriber(self, *, stop_if_unused: bool = True) -> bool:
+    def remove_subscriber(
+        self,
+        *,
+        viewer: bool = False,
+        stop_if_unused: bool = True,
+    ) -> bool:
         with self._subscriber_lock:
             self._subscriber_count = max(0, self._subscriber_count - 1)
+            if viewer:
+                self._viewer_count = max(0, self._viewer_count - 1)
             should_stop = self._subscriber_count == 0
         if should_stop and stop_if_unused:
             self.stop()
@@ -280,6 +302,7 @@ class CameraStream:
         reconnect_delay = RTSP_RECONNECT_DELAY
         stable_frames = 0
         last_publish_at = 0.0
+        last_detection_submit_at = 0.0
 
         while self._running:
             self._set_connection_state("connecting" if self._reconnect_count == 0 else "reconnecting")
@@ -356,13 +379,25 @@ class CameraStream:
                         self._last_frame_at = now
                         self._published_frame_count += 1
 
-                    self.batch_detector.submit(
-                        self.config.id,
-                        published,
-                        frame_id=frame_id,
-                        captured_at=now,
-                        source_stream=self,
+                    with self._subscriber_lock:
+                        has_viewer = self._viewer_count > 0
+                    detection_interval = (
+                        VIEWER_DETECTION_INTERVAL
+                        if has_viewer
+                        else BACKGROUND_DETECTION_INTERVAL
                     )
+                    if now - last_detection_submit_at >= detection_interval:
+                        last_detection_submit_at = now
+                        with self._state_lock:
+                            self._detection_submit_count += 1
+                        self.batch_detector.submit(
+                            self.config.id,
+                            published,
+                            frame_id=frame_id,
+                            captured_at=now,
+                            source_stream=self,
+                            priority=has_viewer,
+                        )
 
             self._close_capture(expected=cap)
             if not self._running:
@@ -421,7 +456,11 @@ class CameraStream:
             frame = self._processed_frame.copy() if copy else self._processed_frame
             return frame, self._processed_frame_id
 
-    def get_raw_frame(self) -> tuple[Optional[np.ndarray], int]:
+    def get_raw_frame(
+        self,
+        *,
+        copy: bool = True,
+    ) -> tuple[Optional[np.ndarray], int]:
         """返回最新原始帧副本；断流后不向分析模块提供陈旧画面。"""
         now = time.perf_counter()
         with self._state_lock:
@@ -430,7 +469,8 @@ class CameraStream:
         with self._raw_lock:
             if self._raw_frame is None:
                 return None, -1
-            return self._raw_frame.copy(), self._raw_frame_id
+            frame = self._raw_frame.copy() if copy else self._raw_frame
+            return frame, self._raw_frame_id
 
     def set_processed_frame(
         self,
@@ -449,6 +489,17 @@ class CameraStream:
 
     def health_snapshot(self) -> dict[str, Any]:
         now = time.perf_counter()
+        with self._subscriber_lock:
+            subscriber_count = self._subscriber_count
+            viewer_count = self._viewer_count
+        with self._raw_lock:
+            raw_shape = self._raw_frame.shape if self._raw_frame is not None else None
+        with self._processed_lock:
+            processed_age = (
+                None
+                if self._processed_updated_at <= 0
+                else now - self._processed_updated_at
+            )
         with self._state_lock:
             last_frame_age = None if self._last_frame_at <= 0 else now - self._last_frame_at
             return {
@@ -463,7 +514,14 @@ class CameraStream:
                 "decode_fps": round(self._decode_fps, 2),
                 "decoded_frames": self._decode_frame_count,
                 "published_frames": self._published_frame_count,
+                "detection_submissions": self._detection_submit_count,
                 "reconnect_count": self._reconnect_count,
                 "read_failure_count": self._read_failure_count,
-                "subscribers": self.subscriber_count,
+                "subscribers": subscriber_count,
+                "viewers": viewer_count,
+                "frame_width": int(raw_shape[1]) if raw_shape is not None else None,
+                "frame_height": int(raw_shape[0]) if raw_shape is not None else None,
+                "processed_frame_age_seconds": (
+                    round(processed_age, 3) if processed_age is not None else None
+                ),
             }

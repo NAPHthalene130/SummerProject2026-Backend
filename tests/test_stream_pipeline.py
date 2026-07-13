@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from app.api.v1 import live
 from app.modules.stream.camera_stream import CameraStream
 from app.modules.stream.stream_manager import StreamManager
+from app.modules.stream.video_track import ProcessedVideoTrack, WEBRTC_MAX_WIDTH
 from app.modules.yolo.batch_detector import BatchDetector, PendingFrame, POST_PROCESS_WORKERS
 from app.utils.camera_manager import CameraConfig
 
@@ -116,6 +117,31 @@ def test_stale_rtsp_frame_is_not_sent_to_webrtc() -> None:
     assert stream.get_latest_frame(copy=False) == (None, -1)
 
 
+def test_viewer_subscriptions_are_tracked_separately() -> None:
+    stream = CameraStream(_camera_config(), _RecordingDetector())  # type: ignore[arg-type]
+    with patch.object(stream, "start") as start:
+        stream.add_subscriber()
+        stream.add_subscriber(viewer=True)
+
+    assert start.call_count == 1
+    assert stream.subscriber_count == 2
+    assert stream.viewer_count == 1
+    assert stream.has_display_viewers is True
+
+    assert stream.remove_subscriber(viewer=True, stop_if_unused=False) is False
+    assert stream.subscriber_count == 1
+    assert stream.viewer_count == 0
+
+
+def test_webrtc_frame_is_bounded_and_preconverted_to_yuv420p() -> None:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    video_frame = ProcessedVideoTrack._prepare_video_frame(frame)
+
+    assert video_frame.width == WEBRTC_MAX_WIDTH
+    assert video_frame.height == 360
+    assert video_frame.format.name == "yuv420p"
+
+
 def test_stop_does_not_release_native_capture_from_another_thread() -> None:
     stream = CameraStream(_camera_config(), _RecordingDetector())  # type: ignore[arg-type]
 
@@ -158,8 +184,12 @@ def _bare_detector_for_pipeline_test() -> BatchDetector:
     detector._streams_lock = threading.RLock()
     detector._metrics_lock = threading.Lock()
     detector._window_total = 0
+    detector._window_viewer = 0
+    detector._window_background = 0
     detector._lifetime_total = 0
     detector._fps = 0.0
+    detector._viewer_fps = 0.0
+    detector._background_fps = 0.0
     detector._last_fps = time.perf_counter()
     detector.trackers = {}
     detector.trails = {}
@@ -248,6 +278,30 @@ def test_batch_event_is_cleared_when_only_inflight_camera_is_pending() -> None:
     assert detector._pending_event.is_set() is False
 
 
+def test_visible_cameras_are_prioritized_without_starving_background() -> None:
+    detector = _bare_detector_for_pipeline_test()
+    now = time.perf_counter()
+    for index in range(2):
+        detector._pending[f"background-{index}"] = PendingFrame(
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            frame_id=index,
+            captured_at=now,
+        )
+    for index in range(8):
+        detector._pending[f"viewer-{index}"] = PendingFrame(
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            frame_id=index,
+            captured_at=now,
+            priority=True,
+        )
+
+    selected = detector._take_batch()
+
+    assert len(selected) == 8
+    assert [pending.priority for _, pending in selected[:7]] == [True] * 7
+    assert selected[7][1].priority is False
+
+
 def test_stopped_stream_cannot_reinsert_a_stale_yolo_frame() -> None:
     detector = _bare_detector_for_pipeline_test()
     current_stream = object()
@@ -277,7 +331,8 @@ def test_slow_rtsp_stop_does_not_block_other_stream_manager_operations() -> None
         subscriber_count = 1
 
         @staticmethod
-        def remove_subscriber(*, stop_if_unused: bool) -> bool:
+        def remove_subscriber(*, viewer: bool, stop_if_unused: bool) -> bool:
+            assert viewer is False
             assert stop_if_unused is False
             return True
 
@@ -322,10 +377,12 @@ def test_webrtc_negotiation_failure_releases_subscription() -> None:
             self.unsubscribed: list[str] = []
 
         @staticmethod
-        def subscribe(camera_id: str):
+        def subscribe(camera_id: str, *, viewer: bool = False):
+            assert viewer is True
             return object()
 
-        def unsubscribe(self, camera_id: str) -> None:
+        def unsubscribe(self, camera_id: str, *, viewer: bool = False) -> None:
+            assert viewer is True
             self.unsubscribed.append(camera_id)
 
     class FakePeer:

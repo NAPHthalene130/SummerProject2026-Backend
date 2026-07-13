@@ -23,6 +23,7 @@ BATCH_SIZE = settings.YOLO_BATCH_SIZE
 POST_PROCESS_WORKERS = settings.YOLO_POST_WORKERS
 BATCH_COLLECT_SECONDS = settings.YOLO_BATCH_COLLECT_MS / 1000.0
 YOLO_IMAGE_SIZE = settings.YOLO_IMAGE_SIZE
+RENDER_ANNOTATED_FRAMES = settings.YOLO_RENDER_ANNOTATED_FRAMES
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class PendingFrame:
     frame: np.ndarray
     frame_id: int
     captured_at: float
+    priority: bool = False
 
 
 class BatchDetector:
@@ -114,7 +116,11 @@ class BatchDetector:
         self._post_pool: Optional[ThreadPoolExecutor] = None
 
         self._fps = 0.0
+        self._viewer_fps = 0.0
+        self._background_fps = 0.0
         self._window_total = 0
+        self._window_viewer = 0
+        self._window_background = 0
         self._lifetime_total = 0
         self._last_fps = time.perf_counter()
         self._metrics_lock = threading.Lock()
@@ -147,6 +153,7 @@ class BatchDetector:
         frame_id: int = -1,
         captured_at: Optional[float] = None,
         source_stream: object | None = None,
+        priority: bool = False,
     ) -> None:
         with self._streams_lock:
             if (
@@ -160,6 +167,7 @@ class BatchDetector:
                     frame=frame,
                     frame_id=frame_id,
                     captured_at=time.perf_counter() if captured_at is None else captured_at,
+                    priority=priority,
                 )
         self._pending_event.set()
 
@@ -172,7 +180,11 @@ class BatchDetector:
         self._stop_event.clear()
         with self._metrics_lock:
             self._fps = 0.0
+            self._viewer_fps = 0.0
+            self._background_fps = 0.0
             self._window_total = 0
+            self._window_viewer = 0
+            self._window_background = 0
             self._last_fps = time.perf_counter()
         self._post_pool = ThreadPoolExecutor(max_workers=POST_PROCESS_WORKERS,
                                             thread_name_prefix="yolo-post")
@@ -247,14 +259,29 @@ class BatchDetector:
     def _take_batch(self) -> list[tuple[str, PendingFrame]]:
         selected: list[tuple[str, PendingFrame]] = []
         with self._pending_lock:
-            for cam_id in list(self._pending):
-                if cam_id in self._post_inflight:
-                    continue
+            eligible = [
+                (cam_id, pending)
+                for cam_id, pending in self._pending.items()
+                if cam_id not in self._post_inflight
+            ]
+            viewer_items = [item for item in eligible if item[1].priority]
+            background_items = [item for item in eligible if not item[1].priority]
+
+            # Reserve one slot for background analysis when at least one such
+            # camera is ready.  With the six-tile monitor wall, the remaining
+            # slots still cover every visible camera in each full batch.
+            viewer_limit = BATCH_SIZE - 1 if background_items else BATCH_SIZE
+            candidates = viewer_items[:viewer_limit]
+            candidates.extend(background_items[: BATCH_SIZE - len(candidates)])
+            if len(candidates) < BATCH_SIZE:
+                candidates.extend(
+                    viewer_items[viewer_limit : viewer_limit + BATCH_SIZE - len(candidates)]
+                )
+
+            for cam_id, _ in candidates:
                 pending = self._pending.pop(cam_id)
                 self._post_inflight.add(cam_id)
                 selected.append((cam_id, pending))
-                if len(selected) >= BATCH_SIZE:
-                    break
 
             has_eligible_pending = any(
                 cam_id not in self._post_inflight for cam_id in self._pending
@@ -321,7 +348,7 @@ class BatchDetector:
             logger.exception("YOLO post-process failed for camera %s", cam_id)
         finally:
             if processed:
-                self._record_processed_frame()
+                self._record_processed_frame(priority=pending.priority)
             self._release_inflight(cam_id)
 
     def _release_inflight(self, cam_id: str) -> None:
@@ -344,15 +371,23 @@ class BatchDetector:
         self._prev_vel.pop(cam_id, None)
         self._prev_ts.pop(cam_id, None)
 
-    def _record_processed_frame(self) -> None:
+    def _record_processed_frame(self, *, priority: bool) -> None:
         now = time.perf_counter()
         with self._metrics_lock:
             self._window_total += 1
+            if priority:
+                self._window_viewer += 1
+            else:
+                self._window_background += 1
             self._lifetime_total += 1
             elapsed = now - self._last_fps
             if elapsed >= 5.0:
                 self._fps = self._window_total / elapsed
+                self._viewer_fps = self._window_viewer / elapsed
+                self._background_fps = self._window_background / elapsed
                 self._window_total = 0
+                self._window_viewer = 0
+                self._window_background = 0
                 self._last_fps = now
                 with self._streams_lock:
                     stream_count = len(self._streams)
@@ -365,9 +400,12 @@ class BatchDetector:
     def performance_snapshot(self) -> dict:
         with self._metrics_lock:
             fps = self._fps
+            viewer_fps = self._viewer_fps
+            background_fps = self._background_fps
             lifetime_total = self._lifetime_total
         with self._pending_lock:
             pending = len(self._pending)
+            priority_pending = sum(item.priority for item in self._pending.values())
             post_inflight = len(self._post_inflight)
         with self._streams_lock:
             stream_count = len(self._streams)
@@ -377,17 +415,21 @@ class BatchDetector:
             "batch_size": BATCH_SIZE,
             "post_process_workers": POST_PROCESS_WORKERS,
             "processed_fps": round(fps, 2),
+            "viewer_processed_fps": round(viewer_fps, 2),
+            "background_processed_fps": round(background_fps, 2),
             "processed_frames": lifetime_total,
             "pending_cameras": pending,
+            "priority_pending_cameras": priority_pending,
             "post_process_inflight": post_inflight,
             "registered_streams": stream_count,
         }
 
     def _process_single(self, cam_id: str, pending: PendingFrame, result) -> None:
-        frame = pending.frame.copy()
+        frame = pending.frame.copy() if RENDER_ANNOTATED_FRAMES else None
         if cam_id not in self.trackers:
             self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
-            self.trails[cam_id] = {}
+            if RENDER_ANNOTATED_FRAMES:
+                self.trails[cam_id] = {}
             self.frame_counts[cam_id] = 0
 
         self.frame_counts[cam_id] += 1
@@ -406,12 +448,14 @@ class BatchDetector:
             class_name = self.class_names.get(class_id, f"cls_{class_id}")
             conf = float(detections.confidence[i]) if detections.confidence is not None else 0.0
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0,0,0,0]
-            labels.append(f"#{track_id} {class_name} {conf:.2f}")
+            if RENDER_ANNOTATED_FRAMES:
+                labels.append(f"#{track_id} {class_name} {conf:.2f}")
             cx, cy = (xyxy[0]+xyxy[2])/2, (xyxy[1]+xyxy[3])/2
-            self.trails[cam_id].setdefault(track_id, []).append((cx, cy))
-            if len(self.trails[cam_id][track_id]) > 30:
-                self.trails[cam_id][track_id].pop(0)
-            self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
+            if RENDER_ANNOTATED_FRAMES:
+                self.trails[cam_id].setdefault(track_id, []).append((cx, cy))
+                if len(self.trails[cam_id][track_id]) > 30:
+                    self.trails[cam_id][track_id].pop(0)
+                self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
             det_list.append({
                 "track_id": track_id, "class_name": class_name,
                 "confidence": conf, "bbox": xyxy,
@@ -421,6 +465,9 @@ class BatchDetector:
             camera_id=cam_id, total_vehicle_count=len(det_list),
             boxes=[BoundingBoxItem(int(d["track_id"]), str(d["class_name"]),
                                   float(d["confidence"]), list(d["bbox"])) for d in det_list],
+            frame_width=int(pending.frame.shape[1]),
+            frame_height=int(pending.frame.shape[0]),
+            captured_at=pending.captured_at,
         )
 
         ts = int(time.time() * 1000)
@@ -477,27 +524,41 @@ class BatchDetector:
             except Exception:
                 pass
 
-        frame = self.box_annotator.annotate(scene=frame, detections=detections)
-        frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
-
-        cf = self.frame_counts[cam_id]
-        stale = [t for t in list(self.trails[cam_id]) if cf - self.trail_age.get(cam_id, {}).get(t, 0) > TRAIL_MAX_AGE]
-        for t in stale:
-            del self.trails[cam_id][t]
-            self.trail_age.get(cam_id, {}).pop(t, None)
-        for t in self.trails[cam_id]:
-            tr = self.trails[cam_id][t]
-            if len(tr) < 2:
-                continue
-            for j in range(1, len(tr)):
-                cv2.line(frame, (int(tr[j-1][0]), int(tr[j-1][1])),
-                         (int(tr[j][0]), int(tr[j][1])), (0, 255, 255), 1)
-
-        with self._streams_lock:
-            s = self._streams.get(cam_id)
-        if s is not None:
-            s.set_processed_frame(
-                frame,
-                frame_id=pending.frame_id,
-                captured_at=pending.captured_at,
+        if RENDER_ANNOTATED_FRAMES and frame is not None:
+            frame = self.box_annotator.annotate(scene=frame, detections=detections)
+            frame = self.label_annotator.annotate(
+                scene=frame,
+                detections=detections,
+                labels=labels,
             )
+
+            cf = self.frame_counts[cam_id]
+            stale = [
+                track_id
+                for track_id in list(self.trails[cam_id])
+                if cf - self.trail_age.get(cam_id, {}).get(track_id, 0) > TRAIL_MAX_AGE
+            ]
+            for track_id in stale:
+                del self.trails[cam_id][track_id]
+                self.trail_age.get(cam_id, {}).pop(track_id, None)
+            for track_id in self.trails[cam_id]:
+                trail = self.trails[cam_id][track_id]
+                if len(trail) < 2:
+                    continue
+                for index in range(1, len(trail)):
+                    cv2.line(
+                        frame,
+                        (int(trail[index - 1][0]), int(trail[index - 1][1])),
+                        (int(trail[index][0]), int(trail[index][1])),
+                        (0, 255, 255),
+                        1,
+                    )
+
+            with self._streams_lock:
+                stream = self._streams.get(cam_id)
+            if stream is not None:
+                stream.set_processed_frame(
+                    frame,
+                    frame_id=pending.frame_id,
+                    captured_at=pending.captured_at,
+                )

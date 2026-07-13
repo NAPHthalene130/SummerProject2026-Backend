@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     # 30-channel RTSP / YOLO pipeline.  Keeping these in BaseSettings makes the
     # same SP2026_* values work both as real environment variables and in .env.
     STREAM_FPS: int = Field(default=15, ge=1, le=60)
+    WEBRTC_MAX_WIDTH: int = Field(default=640, ge=320, le=3840)
     DETECT_RESIZE_WIDTH: int = Field(default=0, ge=0)
     RTSP_OPEN_TIMEOUT_MS: int = Field(default=5000, ge=1000)
     RTSP_READ_TIMEOUT_MS: int = Field(default=5000, ge=1000)
@@ -91,6 +92,16 @@ class Settings(BaseSettings):
     YOLO_BATCH_COLLECT_MS: float = Field(default=8.0, ge=0.0, le=100.0)
     YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
     YOLO_HALF: bool = True
+    # The monitoring wall displays at most six feeds at once.  Give those feeds
+    # an interactive analysis rate while keeping all other cameras on a bounded
+    # background cadence.  This prevents 30 always-on feeds from sharing the
+    # detector equally and reducing every visible feed to roughly one FPS.
+    YOLO_VIEWER_FPS: float = Field(default=10.0, ge=1.0, le=30.0)
+    YOLO_BACKGROUND_FPS: float = Field(default=0.5, ge=0.1, le=10.0)
+    # Bounding boxes are transported as lightweight SSE metadata and rendered
+    # by the browser over the raw WebRTC video.  Annotating full frames in every
+    # YOLO post-process worker is therefore optional and disabled by default.
+    YOLO_RENDER_ANNOTATED_FRAMES: bool = False
 
     # 热重载：开启后 uvicorn 的 watchfiles 会监视整个后端目录（含 logs/、data/orderImg/、__pycache__/），
     # 任意文件写入都会触发"change detected"并可能在 .py 变更时整进程重启。

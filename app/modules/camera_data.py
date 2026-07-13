@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Optional
 
 
@@ -14,10 +15,23 @@ class BoundingBoxItem:
 
 
 class CameraData:
-    def __init__(self, camera_id: str, total_vehicle_count: int, boxes: list[BoundingBoxItem]):
+    def __init__(
+        self,
+        camera_id: str,
+        total_vehicle_count: int,
+        boxes: list[BoundingBoxItem],
+        *,
+        frame_width: int = 0,
+        frame_height: int = 0,
+        captured_at: float = 0.0,
+    ):
         self.camera_id = camera_id
         self.total_vehicle_count = total_vehicle_count
         self.boxes = boxes
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.captured_at = captured_at
+        self.updated_at = time.time()
 
 
 class TrafficIncidentResult:
@@ -84,11 +98,18 @@ class CameraDataStore:
         camera_id: str,
         total_vehicle_count: int,
         boxes: list[BoundingBoxItem],
+        *,
+        frame_width: int = 0,
+        frame_height: int = 0,
+        captured_at: float = 0.0,
     ) -> None:
         self._data[camera_id] = CameraData(
             camera_id=camera_id,
             total_vehicle_count=total_vehicle_count,
             boxes=boxes,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            captured_at=captured_at,
         )
 
     def get_by_camera_id(self, camera_id: str) -> Optional[CameraData]:

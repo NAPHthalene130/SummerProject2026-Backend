@@ -32,7 +32,7 @@ class AnswerResponse(BaseModel):
 @live_router.post("/{camera_id}/offer", response_model=AnswerResponse)
 async def webrtc_offer(camera_id: str, offer: OfferRequest):
     manager = StreamManager()
-    stream = manager.subscribe(camera_id)
+    stream = manager.subscribe(camera_id, viewer=True)
     if stream is None:
         raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
 
@@ -61,7 +61,7 @@ async def webrtc_offer(camera_id: str, offer: OfferRequest):
         # The last subscriber may stop a blocking RTSP read.  Keep that work off
         # FastAPI's event loop so one broken camera cannot stall all WebRTC peers.
         try:
-            await asyncio.to_thread(manager.unsubscribe, camera_id)
+            await asyncio.to_thread(manager.unsubscribe, camera_id, viewer=True)
         except Exception:
             logger.exception("WebRTC unsubscribe failed for camera %s", camera_id)
 

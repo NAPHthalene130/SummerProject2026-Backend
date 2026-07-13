@@ -33,7 +33,12 @@ class StreamManager:
         with self._lock:
             return self._streams.get(camera_id)
 
-    def subscribe(self, camera_id: str) -> Optional[CameraStream]:
+    def subscribe(
+        self,
+        camera_id: str,
+        *,
+        viewer: bool = False,
+    ) -> Optional[CameraStream]:
         with self._lock:
             stream = self._streams.get(camera_id)
             if stream is None:
@@ -44,15 +49,18 @@ class StreamManager:
                 stream = CameraStream(camera_config, detector)
                 detector.register_stream(camera_id, stream)
                 self._streams[camera_id] = stream
-            stream.add_subscriber()
+            stream.add_subscriber(viewer=viewer)
             return stream
 
-    def unsubscribe(self, camera_id: str) -> None:
+    def unsubscribe(self, camera_id: str, *, viewer: bool = False) -> None:
         stream_to_stop: Optional[CameraStream] = None
         with self._lock:
             stream = self._streams.get(camera_id)
             if stream is not None:
-                should_stop = stream.remove_subscriber(stop_if_unused=False)
+                should_stop = stream.remove_subscriber(
+                    viewer=viewer,
+                    stop_if_unused=False,
+                )
                 if should_stop:
                     # Signal first, then detach this generation from YOLO.  The
                     # potentially multi-second FFmpeg join happens outside the
