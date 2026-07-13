@@ -237,10 +237,24 @@ class BatchDetector:
                 order = order[remaining + 1]
             detections = detections[keep]
 
+        raw_boxes = [list(b) for b in (detections.xyxy or [])]
+
         if len(detections) > 0:
             detections = self.trackers[cam_id].update_with_detections(detections)
         else:
             detections.tracker_id = np.array([], dtype=int)
+
+        new_ids: set[int] = set()
+        if len(detections) > 0 and detections.tracker_id is not None:
+            for i in range(len(detections)):
+                tid = int(detections.tracker_id[i])
+                xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else None
+                if xyxy is None:
+                    continue
+                for rb in raw_boxes:
+                    if abs(xyxy[0] - rb[0]) < 10 and abs(xyxy[1] - rb[1]) < 10 and abs(xyxy[2] - rb[2]) < 10 and abs(xyxy[3] - rb[3]) < 10:
+                        new_ids.add(tid)
+                        break
 
         detection_list: list[dict[str, object]] = []
         zx1, zy1, zx2, zy2 = self.zone_rects[cam_id]
@@ -449,12 +463,11 @@ class BatchDetector:
             (80, 200, 120), (255, 105, 180), (128, 0, 128),
             (0, 200, 255), (200, 0, 200), (0, 255, 128), (255, 0, 128),
         ]
-        current_ids = {d["track_id"] for d in detection_list}
         for i in range(len(detections)):
             if detections.tracker_id is None or i >= len(detections.tracker_id):
                 continue
             track_id = int(detections.tracker_id[i])
-            if track_id not in current_ids:
+            if track_id not in new_ids:
                 continue
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
             x1, y1, x2, y2 = map(int, xyxy)
