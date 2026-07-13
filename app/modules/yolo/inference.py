@@ -245,12 +245,16 @@ class FrameProcessor:
 
     def _annotate(self, frame: np.ndarray, detections: sv.Detections, actual_tids: set[int], smap: dict[int, float]) -> np.ndarray:
         import cv2
+        drawn_set = set()
         for i in range(len(detections)):
             if detections.tracker_id is None or i >= len(detections.tracker_id):
                 continue
             tid = int(detections.tracker_id[i])
             if tid not in actual_tids:
                 continue
+            if tid in drawn_set:
+                continue
+            drawn_set.add(tid)
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0,0,0,0]
             x1, y1, x2, y2 = map(int, xyxy)
             cid = int(detections.class_id[i]) if detections.class_id is not None else -1

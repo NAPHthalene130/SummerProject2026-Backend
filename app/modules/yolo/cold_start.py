@@ -8,7 +8,7 @@ from ultralytics import YOLO
 logger = logging.getLogger(__name__)
 
 
-def load_model(model_path: str = "yolo11m-seg.pt", min_confidence: float = 0.1):
+def load_model(model_path: str = "app/modules/yolo/best.pt", min_confidence: float = 0.1):
     """加载YOLO模型并执行预热推理"""
     model = YOLO(model_path)
     try:
