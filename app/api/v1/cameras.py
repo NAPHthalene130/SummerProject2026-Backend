@@ -86,27 +86,44 @@ async def update_detections(req: DetectionUpdateRequest):
     return {"status": "ok", "count": len(box_items)}
 
 
+_INFER_POOL = None
+
+
 @cameras_router.post("/detections/infer")
 async def infer_from_image(camera_id: str = Form(...), image: UploadFile = File(...)):
-    contents = await image.read()
-    np_arr = np.frombuffer(contents, np.uint8)
-    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(400, "Invalid image")
-    from app.modules.yolo.batch_detector import BatchDetector
-    detector = BatchDetector()
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = detector.model(frame_rgb, imgsz=640, verbose=False)[0]
+    import asyncio
+    import concurrent.futures
     from app.modules.camera_data import BoundingBoxItem
+    from app.modules.yolo.batch_detector import BatchDetector
+
+    global _INFER_POOL
+    if _INFER_POOL is None:
+        _INFER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+    contents = await image.read()
+
+    def _infer():
+        np_arr = np.frombuffer(contents, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        detector = BatchDetector()
+        results = detector.model(frame, imgsz=640, verbose=False)[0]
+        boxes = []
+        if results.boxes is not None:
+            for i in range(len(results.boxes)):
+                cls_id = int(results.boxes.cls[i])
+                conf = float(results.boxes.confidence[i])
+                x1, y1, x2, y2 = map(int, results.boxes.xyxy[i].tolist())
+                cls_name = detector.class_names.get(cls_id, f"cls_{cls_id}")
+                boxes.append(BoundingBoxItem(track_id=i, class_name=cls_name, confidence=conf, bbox=[x1, y1, x2, y2]))
+        return boxes
+
+    boxes = await asyncio.get_event_loop().run_in_executor(_INFER_POOL, _infer)
+    if boxes is None:
+        raise HTTPException(400, "Invalid image")
+
     store = CameraDataStore()
-    boxes = []
-    if results.boxes is not None:
-        for i in range(len(results.boxes)):
-            cls_id = int(results.boxes.cls[i])
-            conf = float(results.boxes.confidence[i])
-            x1, y1, x2, y2 = map(int, results.boxes.xyxy[i].tolist())
-            cls_name = detector.class_names.get(cls_id, f"cls_{cls_id}")
-            boxes.append(BoundingBoxItem(track_id=i, class_name=cls_name, confidence=conf, bbox=[x1, y1, x2, y2]))
     store.update(camera_id=camera_id, total_vehicle_count=len(boxes), boxes=boxes)
     return {"status": "ok", "count": len(boxes), "boxes": [{"class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox} for b in boxes]}
     from app.modules.camera_data import BoundingBoxItem
