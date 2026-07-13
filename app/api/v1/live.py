@@ -1,7 +1,11 @@
+import asyncio
 import logging
 
+import cv2
+import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.modules.stream import ProcessedVideoTrack, StreamManager
@@ -19,6 +23,29 @@ class OfferRequest(BaseModel):
 class AnswerResponse(BaseModel):
     sdp: str
     type: str
+
+
+@live_router.get("/{camera_id}/mjpeg")
+async def camera_mjpeg(camera_id: str):
+    manager = StreamManager()
+    stream = manager.subscribe(camera_id)
+    if stream is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    async def gen():
+        blank = cv2.imencode(".jpg", np.zeros((480, 640, 3), dtype=np.uint8))[1].tobytes()
+        while True:
+            frame_rgb, frame_id = stream.get_latest_frame()
+            if frame_rgb is None:
+                frame = blank
+            else:
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                _, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                frame = buf.tobytes()
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            await asyncio.sleep(0.05)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @live_router.post("/{camera_id}/offer", response_model=AnswerResponse)

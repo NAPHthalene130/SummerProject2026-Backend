@@ -202,10 +202,10 @@ class BatchDetector:
         else:
             detections.tracker_id = np.array([], dtype=int)
 
-        labels: list[str] = []
         detection_list: list[dict[str, object]] = []
         zx1, zy1, zx2, zy2 = self.zone_rects[cam_id]
         inside = self._inside_zone[cam_id]
+        speed_map: dict[int, float] = {}
         for i in range(len(detections)):
             if detections.tracker_id is not None and i < len(detections.tracker_id):
                 track_id = int(detections.tracker_id[i])
@@ -216,8 +216,6 @@ class BatchDetector:
             class_name = self.class_names.get(class_id, f"cls_{class_id}")
             conf = float(detections.confidence[i]) if detections.confidence is not None else 0.0
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
-
-            labels.append(f"#{track_id} {class_name} {conf:.2f}")
 
             cx = (xyxy[0] + xyxy[2]) / 2
             cy = (xyxy[1] + xyxy[3]) / 2
@@ -317,6 +315,7 @@ class BatchDetector:
             })
 
             self._prev_velocities[cam_id][track_id] = vel
+            speed_map[track_id] = vel * 3.6
 
         self._prev_positions[cam_id] = current_positions
 
@@ -327,7 +326,17 @@ class BatchDetector:
                 pass
 
         frame = self.box_annotator.annotate(scene=frame, detections=detections)
-        frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
+        for i in range(len(detections)):
+            if detections.tracker_id is None or i >= len(detections.tracker_id):
+                continue
+            track_id = int(detections.tracker_id[i])
+            xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
+            x1, y1, x2, y2 = map(int, xyxy)
+            class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
+            cls_name = self.class_names.get(class_id, "?")
+            spd = speed_map.get(track_id, 0.0)
+            label = f"{cls_name} {spd:.0f}km/h"
+            cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
         if cam_id in self.zone_rects:
             self._prune_events(self._entry_events[cam_id], now)

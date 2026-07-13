@@ -11,6 +11,7 @@ class CameraResponse(BaseModel):
 class CameraStatsItem(BaseModel):
     camera_id: str
     total_vehicle_count: int
+    boxes: list[dict] = []
 
 
 class CameraStatsResponse(BaseModel):
