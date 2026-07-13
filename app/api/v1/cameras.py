@@ -4,6 +4,7 @@ from typing import List
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
 from app.modules.yolo import CameraDataStore
@@ -55,6 +56,32 @@ async def get_camera_boxes(camera_id: str):
             for b in data.boxes
         ]
     }
+
+
+class DetectionUpdateRequest(BaseModel):
+    camera_id: str
+    boxes: list[dict]
+
+
+@cameras_router.post("/boxes/update")
+async def update_detections(req: DetectionUpdateRequest):
+    from app.modules.camera_data import BoundingBoxItem
+    store = CameraDataStore()
+    box_items = [
+        BoundingBoxItem(
+            track_id=b.get("track_id", 0),
+            class_name=b.get("class_name", ""),
+            confidence=b.get("confidence", 0.0),
+            bbox=b.get("bbox", [0, 0, 0, 0]),
+        )
+        for b in req.boxes
+    ]
+    store.update(
+        camera_id=req.camera_id,
+        total_vehicle_count=len(box_items),
+        boxes=box_items,
+    )
+    return {"status": "ok", "count": len(box_items)}
 
 
 @cameras_router.get("/boxes/stream")
