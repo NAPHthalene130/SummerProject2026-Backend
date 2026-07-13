@@ -74,6 +74,7 @@ class CameraDataStore:
                     cls._instance = super().__new__(cls)
                     cls._instance._data: dict[str, CameraData] = {}
                     cls._instance._incident_data: dict[str, TrafficIncidentResult] = {}
+                    cls._instance._traffic_metrics: dict[str, dict[str, float]] = {}
                     cls._instance._active_incidents: dict[str, set[str]] = {}
                     cls._instance._consecutive_normal_count: dict[str, int] = {}
         return cls._instance
@@ -95,6 +96,22 @@ class CameraDataStore:
 
     def get_all(self) -> dict[str, CameraData]:
         return dict(self._data)
+
+    def update_traffic_metrics(
+        self,
+        camera_id: str,
+        *,
+        avg_speed_kmh: float,
+        vehicle_count: int,
+    ) -> None:
+        self._traffic_metrics[camera_id] = {
+            "avg_speed_kmh": float(avg_speed_kmh),
+            "vehicle_count": float(vehicle_count),
+        }
+
+    def get_traffic_metrics(self, camera_id: str) -> Optional[dict[str, float]]:
+        metrics = self._traffic_metrics.get(camera_id)
+        return dict(metrics) if metrics else None
 
     def update_incident_result(self, camera_id: str, result: TrafficIncidentResult) -> None:
         self._incident_data[camera_id] = result
