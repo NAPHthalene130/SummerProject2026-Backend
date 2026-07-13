@@ -59,8 +59,17 @@ async def stream_all_boxes():
                 detector = BatchDetector()
                 payload["_traffic"] = detector.get_all_traffic_flow()
                 payload["_lanes"] = {}
+                payload["_derived"] = {}
                 for cam_id, data in store.get_all().items():
                     payload["_lanes"][cam_id] = data.lane_count
+                    payload["_derived"][cam_id] = {
+                        "avg_speed": data.avg_speed,
+                        "max_speed": data.max_speed,
+                        "car_count": data.car_count,
+                        "truck_count": data.truck_count,
+                        "bus_count": data.bus_count,
+                        "moto_count": data.moto_count,
+                    }
             except Exception:
                 pass
             yield f"data: {json.dumps(payload)}\n\n"

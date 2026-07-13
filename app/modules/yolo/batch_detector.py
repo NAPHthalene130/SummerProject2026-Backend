@@ -283,10 +283,21 @@ class BatchDetector:
             })
 
         lane_positions = []
+        speeds_list = []
+        headways_list = []
+        car_count = 0; truck_count = 0; bus_count = 0; moto_count = 0
         for d in detection_list:
             bbox = d.get("bbox", [0, 0, 0, 0])
             cx = (bbox[0] + bbox[2]) / 2
             lane_positions.append(cx)
+            tid = d.get("track_id", -1)
+            spd = speed_map.get(tid, 0.0)
+            speeds_list.append(spd)
+            cls = d.get("class_name", "").lower()
+            if cls == "car": car_count += 1
+            elif cls in ("truck", "trailer"): truck_count += 1
+            elif cls == "bus": bus_count += 1
+            elif cls in ("motorcycle", "bike", "bicycle"): moto_count += 1
         lane_count = 0
         if len(lane_positions) >= 3:
             lane_positions.sort()
@@ -300,6 +311,8 @@ class BatchDetector:
                 lane_count = max(1, min(clusters, 8))
         else:
             lane_count = max(1, len(lane_positions))
+        avg_speed = float(np.mean(speeds_list)) if speeds_list else 0.0
+        max_speed = float(np.max(speeds_list)) if speeds_list else 0.0
 
         CameraDataStore().update(
             camera_id=cam_id,
@@ -314,6 +327,12 @@ class BatchDetector:
                 for d in detection_list
             ],
             lane_count=lane_count,
+            avg_speed=avg_speed,
+            max_speed=max_speed,
+            car_count=car_count,
+            truck_count=truck_count,
+            bus_count=bus_count,
+            moto_count=moto_count,
         )
 
         timestamp_ms = int(time.time() * 1000)

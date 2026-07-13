@@ -14,11 +14,20 @@ class BoundingBoxItem:
 
 
 class CameraData:
-    def __init__(self, camera_id: str, total_vehicle_count: int, boxes: list[BoundingBoxItem], lane_count: int = 0):
+    def __init__(self, camera_id: str, total_vehicle_count: int, boxes: list[BoundingBoxItem], lane_count: int = 0,
+                 avg_speed: float = 0.0, max_speed: float = 0.0, car_count: int = 0, truck_count: int = 0,
+                 bus_count: int = 0, moto_count: int = 0, avg_headway: float = 0.0):
         self.camera_id = camera_id
         self.total_vehicle_count = total_vehicle_count
         self.boxes = boxes
         self.lane_count = lane_count
+        self.avg_speed = avg_speed
+        self.max_speed = max_speed
+        self.car_count = car_count
+        self.truck_count = truck_count
+        self.bus_count = bus_count
+        self.moto_count = moto_count
+        self.avg_headway = avg_headway
 
 
 class TrafficIncidentResult:
@@ -85,12 +94,26 @@ class CameraDataStore:
         total_vehicle_count: int,
         boxes: list[BoundingBoxItem],
         lane_count: int = 0,
+        avg_speed: float = 0.0,
+        max_speed: float = 0.0,
+        car_count: int = 0,
+        truck_count: int = 0,
+        bus_count: int = 0,
+        moto_count: int = 0,
+        avg_headway: float = 0.0,
     ) -> None:
         self._data[camera_id] = CameraData(
             camera_id=camera_id,
             total_vehicle_count=total_vehicle_count,
             boxes=boxes,
             lane_count=lane_count,
+            avg_speed=avg_speed,
+            max_speed=max_speed,
+            car_count=car_count,
+            truck_count=truck_count,
+            bus_count=bus_count,
+            moto_count=moto_count,
+            avg_headway=avg_headway,
         )
 
     def get_by_camera_id(self, camera_id: str) -> Optional[CameraData]:
