@@ -16,10 +16,13 @@ from app.modules.yolo.inference import FrameProcessor
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 8
-POST_WORKERS = 4
-YOLO_IMSZ = 640
-USE_HALF = False
+from app.config import settings
+
+BATCH_SIZE = settings.YOLO_BATCH_SIZE
+POST_WORKERS = settings.YOLO_POST_WORKERS
+YOLO_IMSZ = settings.YOLO_IMAGE_SIZE
+USE_HALF = settings.YOLO_HALF
+BATCH_COLLECT_SEC = settings.YOLO_BATCH_COLLECT_MS / 1000.0
 
 
 class BatchDetector:
@@ -35,7 +38,7 @@ class BatchDetector:
         return cls._instance
 
     def _init(self, model_path: str) -> None:
-        cv2.setNumThreads(2)
+        cv2.setNumThreads(settings.OPENCV_THREADS)
         self.model, self.device = load_model(model_path)
         self.class_names = self.model.names
         self._use_half = USE_HALF and self.device != "cpu"
@@ -100,9 +103,11 @@ class BatchDetector:
     def _loop(self) -> None:
         kw = {"half": True} if self._use_half else {}
         while self._running:
-            self._pending_event.wait(timeout=0.05)
+            self._pending_event.wait(timeout=0.02)
             if not self._running:
                 break
+            if BATCH_COLLECT_SEC > 0 and len(self._take_peek()) < BATCH_SIZE:
+                self._pending_event.wait(timeout=BATCH_COLLECT_SEC)
             items = self._take_batch()
             if not items:
                 continue
@@ -122,6 +127,10 @@ class BatchDetector:
                         self._postprocess_job(cid, frame, result)
                 except RuntimeError:
                     self._release_inflight(cid)
+
+    def _take_peek(self) -> list[str]:
+        with self._pending_lock:
+            return [c for c in self._pending if c not in self._post_inflight]
 
     def _take_batch(self) -> list[tuple[str, np.ndarray]]:
         selected: list[tuple[str, np.ndarray]] = []
