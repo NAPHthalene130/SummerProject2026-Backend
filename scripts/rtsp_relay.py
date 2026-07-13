@@ -101,7 +101,7 @@ class CameraCapture:
                 cap.open(self.url)
                 continue
             self._frame_count += 1
-            if self._frame_count % 3 == 0 and CLOUD_API:
+            if CLOUD_API:
                 threading.Thread(target=self._send_to_cloud, args=(frame.copy(),), daemon=True).start()
             ret_jpg, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
             if ret_jpg:
