@@ -113,7 +113,7 @@ class BatchDetector:
             self._processors[cam_id] = fp
         fp = self._processors[cam_id]
 
-        dlist, annotated, now, stats = fp.process(self.model, frame, self.device, result)
+        dlist, annotated, stats = fp.process(self.model, frame, self.device, result)
 
         stream = self._streams.get(cam_id)
         if stream is not None:
@@ -123,7 +123,7 @@ class BatchDetector:
         fp = self._processors.get(cam_id)
         if fp is None:
             return {"entry_count": 0, "exit_count": 0, "flow_per_min": 0.0}
-        return fp._get_flow()
+        return fp.get_traffic_flow()
 
     def get_all_traffic_flow(self) -> dict[str, dict]:
         return {cid: self.get_traffic_flow(cid) for cid in self._processors}

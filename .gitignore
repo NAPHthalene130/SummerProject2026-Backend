@@ -62,3 +62,4 @@ htmlcov/
 *.engine
 !app/modules/yolo/models/best.pt
 config.yaml
+config2.yaml
