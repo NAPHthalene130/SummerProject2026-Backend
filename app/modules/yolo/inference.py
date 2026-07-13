@@ -1,6 +1,5 @@
 """推理模块：接收帧 → YOLO推理 → ByteTrack追踪 → 速度/车流计算"""
 
-import collections
 import logging
 import time
 
@@ -15,19 +14,13 @@ logger = logging.getLogger(__name__)
 MIN_CONFIDENCE = 0.1
 NMS_OVERLAP = 0.5
 LOST_BUFFER = 30
-TRAIL_MAX_AGE = 30
+TRAIL_MAX_AGE = 60
 PIXEL_TO_METER = 0.05
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
 
 
-def _sv_color_from_tuple(t: tuple) -> sv.Color:
-    return sv.Color(r=t[0], g=t[1], b=t[2])
-
-
 class FrameProcessor:
-    """单路摄像头帧处理器（基于supervision）"""
-
     def __init__(self, cam_id: str, class_names: dict):
         self.cam_id = cam_id
         self.class_names = class_names
@@ -35,39 +28,38 @@ class FrameProcessor:
         self.trails: dict[int, list] = {}
         self.trail_age: dict[int, int] = {}
         self.frame_count = 0
+        self.frame_h = 480
+        self.frame_w = 640
         self.line_zone: sv.LineZone | None = None
         self.zone_annotator = sv.LineZoneAnnotator(text_thickness=1, text_color=sv.Color.WHITE)
         self._prev_positions: dict[int, dict] = {}
-        self._prev_velocities: dict[int, float] = {}
         self._trajectories: dict[int, list] = {}
         self._speed_last_update: dict[int, float] = {}
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
+        self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=30)
 
     def init_zone(self, h: int, w: int, margin: float = 0.15):
-        self.line_zone = sv.LineZone(
-            start=sv.Point(0, int(h * 0.6)),
-            end=sv.Point(w, int(h * 0.6)),
-        )
+        self.frame_h, self.frame_w = h, w
+        self.line_zone = sv.LineZone(start=sv.Point(0, int(h * 0.6)), end=sv.Point(w, int(h * 0.6)))
 
     def _get_color(self, track_id: int) -> sv.Color:
         if track_id not in self._track_colors:
             self._track_colors[track_id] = COLOR_PALETTE.by_idx(track_id % len(COLOR_PALETTE))
         return self._track_colors[track_id]
 
-    def _get_color_bgr(self, track_id: int) -> tuple:
-        c = self._get_color(track_id)
-        return (c.blue, c.green, c.red)
+    def _perspective_scale(self, cy: float) -> float:
+        """基于y坐标的透视缩放：远处（cy小）放大，近处（cy大）缩小"""
+        ratio = cy / max(self.frame_h, 1)
+        return 0.6 + ratio * 0.8
 
     def process(self, model, frame: np.ndarray, device, results) -> tuple[list[dict], np.ndarray, dict]:
         self.frame_count += 1
         now = time.time()
 
         detections = sv.Detections.from_ultralytics(results)
-
         if len(detections) > 0 and detections.confidence is not None:
             detections = detections[detections.confidence >= MIN_CONFIDENCE]
-
         if len(detections) > 1 and detections.xyxy is not None:
             detections = self._nms(detections)
 
@@ -90,7 +82,8 @@ class FrameProcessor:
                         actual_tids.add(tid)
                         break
 
-        filtered = detections[[i for i in range(len(detections)) if int(detections.tracker_id[i]) in actual_tids]] if len(detections) > 0 else detections
+        idx = [i for i in range(len(detections)) if int(detections.tracker_id[i]) in actual_tids]
+        filtered = detections[idx] if len(detections) > 0 and idx else detections
 
         detection_list: list[dict] = []
         speed_map: dict[int, float] = {}
@@ -104,18 +97,20 @@ class FrameProcessor:
                 xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
                 cx = (xyxy[0] + xyxy[2]) / 2
                 cy = (xyxy[1] + xyxy[3]) / 2
+
                 self.trails.setdefault(tid, []).append((cx, cy))
                 if len(self.trails[tid]) > 30:
                     self.trails[tid].pop(0)
                 self.trail_age[tid] = self.frame_count
-                vel, vel_kmh = self._calc_speed(tid, cx, cy, now)
+
+                vel_kmh = self._calc_speed(tid, cx, cy, now)
                 detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
                 speed_map[tid] = vel_kmh
 
         self._update_store(detection_list, speed_map)
         stats = self._compute_stats(detection_list, speed_map)
 
-        # supervision标注
+        # supervision标注框+标签+轨迹
         if len(filtered) > 0:
             labels = []
             for i in range(len(filtered)):
@@ -129,6 +124,7 @@ class FrameProcessor:
                                                 text_scale=0.35, text_thickness=1)
             frame = box_annotator.annotate(scene=frame, detections=filtered)
             frame = label_annotator.annotate(scene=frame, detections=filtered, labels=labels)
+            frame = self.trace_annotator.annotate(scene=frame, detections=filtered)
 
         # LineZone进出计数
         if self.line_zone is not None and len(filtered) > 0:
@@ -136,7 +132,6 @@ class FrameProcessor:
             self.zone_annotator.annotate(frame=frame, line_counter=self.line_zone)
 
         self._cleanup_trails()
-
         return detection_list, frame, stats
 
     def _nms(self, detections: sv.Detections) -> sv.Detections:
@@ -163,48 +158,59 @@ class FrameProcessor:
             order = order[remaining + 1]
         return detections[keep]
 
-    def _calc_speed(self, track_id: int, cx: float, cy: float, now: float):
-        dt_sec = 0.033
+    def _calc_speed(self, track_id: int, cx: float, cy: float, now: float) -> float:
         traj = self._trajectories.setdefault(track_id, [])
         traj.append((cx, cy, now))
-        cutoff = now - 1.5
+        cutoff = now - 2.0
         self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
+        pts = self._trajectories[track_id]
 
-        vel = 0.0
+        vel_kmh = self._speed_stable.get(track_id, 0.0)
         lu = self._speed_last_update.get(track_id, 0.0)
-        stable = self._speed_stable.get(track_id, 0.0)
+        if now - lu < 0.4:
+            return vel_kmh
 
-        if now - lu >= 0.5:
-            pts = self._trajectories[track_id]
-            if len(pts) >= 5:
-                xs = np.array([p[0] for p in pts])
-                ys = np.array([p[1] for p in pts])
-                ts = np.array([p[2] for p in pts])
-                dt = ts[-1] - ts[0]
-                if dt > 0.3:
-                    total = sum(np.sqrt((xs[j] - xs[j-1])**2 + (ys[j] - ys[j-1])**2) for j in range(1, len(pts)))
-                    speed_px = total / dt
-                    vel = speed_px * PIXEL_TO_METER
-                    vkmh = vel * 3.6
-                    if stable > 0 and abs(vkmh - stable) < 5:
-                        vkmh = stable
-                    self._speed_stable[track_id] = vkmh
-                    self._speed_last_update[track_id] = now
-                else:
-                    prev = self._prev_positions.get(track_id)
-                    if prev:
-                        dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
-                        vel = (dp * PIXEL_TO_METER) / max(dt_sec, 0.01)
-            else:
-                prev = self._prev_positions.get(track_id)
-                if prev:
-                    dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
-                    vel = (dp * PIXEL_TO_METER) / max(dt_sec, 0.01)
+        if len(pts) < 4:
+            prev = self._prev_positions.get(track_id)
+            if prev:
+                dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
+                scale = self._perspective_scale(cy)
+                vel_kmh = dp * PIXEL_TO_METER * scale * 3.6 * 30
+            self._prev_positions[track_id] = {"cx": cx, "cy": cy}
+            self._speed_last_update[track_id] = now
+            if vel_kmh < 0.5:
+                vel_kmh = 0.0
+            self._speed_stable[track_id] = vel_kmh
+            return vel_kmh
 
-        vkmh = self._speed_stable.get(track_id, vel * 3.6)
-        self._prev_velocities[track_id] = vel
+        xs = np.array([p[0] for p in pts])
+        ys = np.array([p[1] for p in pts])
+        ts = np.array([p[2] for p in pts])
+        dt = ts[-1] - ts[0]
+        if dt < 0.2:
+            self._prev_positions[track_id] = {"cx": cx, "cy": cy}
+            return vel_kmh
+
+        try:
+            slope, _ = np.polyfit(ts, xs, 1)
+            speed_px = abs(slope)
+        except np.linalg.LinAlgError:
+            dx = xs[-1] - xs[0]
+            speed_px = abs(dx) / max(dt, 0.01)
+
+        avg_cy = float(np.mean(ys))
+        scale = self._perspective_scale(avg_cy)
+        new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
+
+        if new_kmh < 0.5:
+            new_kmh = 0.0
+        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 8:
+            new_kmh = vel_kmh * 0.7 + new_kmh * 0.3
+
+        self._speed_stable[track_id] = new_kmh
+        self._speed_last_update[track_id] = now
         self._prev_positions[track_id] = {"cx": cx, "cy": cy}
-        return vel, vkmh
+        return new_kmh
 
     def _update_store(self, detection_list: list[dict], speed_map: dict[int, float]):
         cx_list = [((d["bbox"][0] + d["bbox"][2]) / 2) for d in detection_list]
@@ -228,13 +234,14 @@ class FrameProcessor:
     def _estimate_lanes(self, cx_list: list[float]) -> int:
         if len(cx_list) < 3:
             return max(1, len(cx_list))
-        cx_list.sort()
-        gaps = [cx_list[i+1] - cx_list[i] for i in range(len(cx_list)-1)]
-        mg = float(np.mean(gaps)) if gaps else 0
-        if mg > 5:
+        cx = np.array(cx_list)
+        cx.sort()
+        gaps = np.diff(cx)
+        mg = float(np.mean(gaps))
+        if mg > 3:
             clusters = 1
             for g in gaps:
-                if g > mg * 0.6:
+                if g > mg * 0.5:
                     clusters += 1
             return max(1, min(clusters, 8))
         return max(1, len(cx_list))
