@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.modules.agent.agent import Agent
+from app.modules.agent.android_assistant import AndroidAssistant
 from app.modules.agent.workflow import AgentWorkflow
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,26 @@ async def chat(request: ChatRequest) -> ChatResponse:
     except Exception as exc:
         logger.exception("Agent chat failed")
         raise HTTPException(status_code=500, detail=f"Agent处理异常: {exc}")
+
+
+@agent_router.post(
+    "/android/chat",
+    response_model=ChatResponse,
+    summary="Android交通助手对话",
+)
+async def android_chat(request: ChatRequest) -> ChatResponse:
+    """Android端只读交通助手，支持按工单ID查询和交通法规RAG检索。"""
+    thread_id = request.thread_id or str(uuid.uuid4())
+
+    try:
+        reply = await AndroidAssistant().chat(request.message, thread_id=thread_id)
+        return ChatResponse(reply=reply, thread_id=thread_id)
+    except RuntimeError as exc:
+        logger.exception("Android assistant chat failed")
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Android assistant chat failed")
+        raise HTTPException(status_code=500, detail=f"Android助手处理异常: {exc}")
 
 
 @agent_router.post("/chat/stream", summary="Agent流式对话(SSE)")
@@ -118,6 +139,16 @@ async def clear_session(thread_id: str) -> dict:
     except Exception as exc:
         logger.exception("clear session failed")
         raise HTTPException(status_code=500, detail=f"清除会话失败: {exc}")
+
+
+@agent_router.delete("/android/session/{thread_id}", summary="清除Android助手会话记忆")
+async def clear_android_session(thread_id: str) -> dict:
+    try:
+        AndroidAssistant().clear_memory(thread_id)
+        return {"status": "ok", "thread_id": thread_id}
+    except Exception as exc:
+        logger.exception("clear Android assistant session failed")
+        raise HTTPException(status_code=500, detail=f"清除Android助手会话失败: {exc}")
 
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
