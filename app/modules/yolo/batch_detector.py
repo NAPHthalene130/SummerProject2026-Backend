@@ -213,28 +213,28 @@ class BatchDetector:
             conf_mask = detections.confidence >= self.MIN_CONFIDENCE
             detections = detections[conf_mask]
 
-        if len(detections) > 0 and detections.xyxy is not None:
+        if len(detections) > 0 and detections.xyxy is not None and len(detections) > 1:
+            boxes_tensor = np.array(detections.xyxy)
+            scores = np.array(detections.confidence) if detections.confidence is not None else np.ones(len(detections))
+            order = scores.argsort()[::-1]
             keep = []
-            boxes = detections.xyxy
-            for i in range(len(boxes)):
-                keep_i = True
-                for j in range(i):
-                    if j not in keep:
-                        continue
-                    xi1, yi1, xi2, yi2 = boxes[i]
-                    xj1, yj1, xj2, yj2 = boxes[j]
-                    ix1, iy1 = max(xi1, xj1), max(yi1, yj1)
-                    ix2, iy2 = min(xi2, xj2), min(yi2, yj2)
-                    if ix1 < ix2 and iy1 < iy2:
-                        inter = (ix2 - ix1) * (iy2 - iy1)
-                        area_i = (xi2 - xi1) * (yi2 - yi1)
-                        area_j = (xj2 - xj1) * (yj2 - yj1)
-                        iou = inter / min(area_i, area_j)
-                        if iou > self.NMS_OVERLAP:
-                            keep_i = False
-                            break
-                if keep_i:
-                    keep.append(i)
+            while len(order) > 0:
+                i = order[0]
+                keep.append(i)
+                if len(order) == 1:
+                    break
+                xi1, yi1, xi2, yi2 = boxes_tensor[i]
+                xj1, yj1, xj2, yj2 = boxes_tensor[order[1:]].T
+                ix1 = np.maximum(xi1, xj1)
+                iy1 = np.maximum(yi1, yj1)
+                ix2 = np.minimum(xi2, xj2)
+                iy2 = np.minimum(yi2, yj2)
+                inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+                area_i = (xi2 - xi1) * (yi2 - yi1)
+                area_j = (xj2 - xj1) * (yj2 - yj1)
+                iou = inter / (area_i + area_j - inter + 1e-6)
+                remaining = np.where(iou <= self.NMS_OVERLAP)[0]
+                order = order[remaining + 1]
             detections = detections[keep]
 
         if len(detections) > 0:
@@ -430,13 +430,13 @@ class BatchDetector:
             (80, 200, 120), (255, 105, 180), (128, 0, 128),
             (0, 200, 255), (200, 0, 200), (0, 255, 128), (255, 0, 128),
         ]
+        current_ids = {d["track_id"] for d in detection_list}
         for i in range(len(detections)):
             if detections.tracker_id is None or i >= len(detections.tracker_id):
                 continue
-            conf = detections.confidence[i] if detections.confidence is not None and i < len(detections.confidence) else 0.0
-            if conf <= 0:
-                continue
             track_id = int(detections.tracker_id[i])
+            if track_id not in current_ids:
+                continue
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
             x1, y1, x2, y2 = map(int, xyxy)
             class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
