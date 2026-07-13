@@ -18,12 +18,6 @@ LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
 PIXEL_TO_METER = 0.05
 
-sv.Color.WHITE
-sv.Color. GREEN
-sv.Color.RED
-sv.Color.BLUE
-sv.Color.YELLOW
-
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
 
 
@@ -75,7 +69,7 @@ class FrameProcessor:
             detections = detections[detections.confidence >= MIN_CONFIDENCE]
 
         if len(detections) > 1 and detections.xyxy is not None:
-            detections = sv.nms(detections, threshold=NMS_OVERLAP)
+            detections = self._nms(detections)
 
         raw_boxes = [list(b) for b in (detections.xyxy.tolist() if detections.xyxy is not None else [])]
 
@@ -144,6 +138,30 @@ class FrameProcessor:
         self._cleanup_trails()
 
         return detection_list, frame, stats
+
+    def _nms(self, detections: sv.Detections) -> sv.Detections:
+        boxes = np.array(detections.xyxy)
+        scores = np.array(detections.confidence) if detections.confidence is not None else np.ones(len(detections))
+        order = scores.argsort()[::-1]
+        keep = []
+        while len(order) > 0:
+            i = order[0]
+            keep.append(i)
+            if len(order) == 1:
+                break
+            xi1, yi1, xi2, yi2 = boxes[i]
+            rest = boxes[order[1:]]
+            ix1 = np.maximum(xi1, rest[:, 0])
+            iy1 = np.maximum(yi1, rest[:, 1])
+            ix2 = np.minimum(xi2, rest[:, 2])
+            iy2 = np.minimum(yi2, rest[:, 3])
+            inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+            area_i = (xi2 - xi1) * (yi2 - yi1)
+            area_j = (rest[:, 2] - rest[:, 0]) * (rest[:, 3] - rest[:, 1])
+            iou = inter / (area_i + area_j - inter + 1e-6)
+            remaining = np.where(iou <= NMS_OVERLAP)[0]
+            order = order[remaining + 1]
+        return detections[keep]
 
     def _calc_speed(self, track_id: int, cx: float, cy: float, now: float):
         dt_sec = 0.033
