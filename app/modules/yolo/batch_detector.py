@@ -433,6 +433,9 @@ class BatchDetector:
         for i in range(len(detections)):
             if detections.tracker_id is None or i >= len(detections.tracker_id):
                 continue
+            conf = detections.confidence[i] if detections.confidence is not None and i < len(detections.confidence) else 0.0
+            if conf <= 0:
+                continue
             track_id = int(detections.tracker_id[i])
             xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0, 0, 0, 0]
             x1, y1, x2, y2 = map(int, xyxy)
