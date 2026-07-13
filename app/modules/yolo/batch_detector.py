@@ -51,6 +51,9 @@ class BatchDetector:
             logger.warning("BatchDetector running on CPU (torch import failed)")
         self.model.to(self.device)
         self.class_names = self.model.names
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        self.model(dummy, imgsz=640, verbose=False)
+        logger.info("YOLO model warm-up complete")
 
         self._streams: dict[str, object] = {}
         self._pending_frames: dict[str, np.ndarray] = {}
