@@ -82,6 +82,15 @@ class CameraStream:
         self._frame_ready.clear()
 
     def _init_rtsp(self) -> bool:
+        import socket
+        from urllib.parse import urlparse
+        parsed = urlparse(self.config.url)
+        if parsed.hostname:
+            try:
+                s = socket.create_connection((parsed.hostname, parsed.port or 554), timeout=3)
+                s.close()
+            except Exception:
+                return False
         cap = cv2.VideoCapture(self.config.url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             return False
