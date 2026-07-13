@@ -1,9 +1,25 @@
 import logging
 import logging.handlers
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# 抑制 ffmpeg/libav 的 H.264 解码告警刷屏（控制台红色 [h264 @ ...] co located POCs
+# unavailable / mmco: unref short failure / Missing reference picture ...）。这些由 RTSP
+# 解码器经 av_log 直接写 C 层 stderr(fd 2)，PowerShell 以红色显示。OPENCV_FFMPEG_LOGLEVEL
+# 在部分 opencv 构建中对 RTSP 解码路径不生效，故在 fd 层将 stderr 重定向到 devnull；
+# 同时把 Python 的 sys.stderr 重新绑定到原始 fd，保证 uvicorn 日志与异常栈仍在控制台显示。
+_real_stderr_fd = os.dup(2)
+_devnull_fd = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_devnull_fd, 2)
+os.close(_devnull_fd)
+sys.stderr = os.fdopen(_real_stderr_fd, "w", encoding="utf-8", buffering=1)
+sys.__stderr__ = sys.stderr
+
+# RTSP 选项：仅用 TCP 传输（避免 UDP 丢包）。
+# 注意：flags;low_delay / analyzeduration;0 会禁用 B 帧重排序，导致 mp4Tortsp 的含 B 帧码流
+# 持续报 "reference picture missing during reorder" / "co located POCs unavailable" 并刷屏，故不启用。
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
@@ -135,5 +151,5 @@ if __name__ == "__main__":
         "main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=settings.DEBUG,
+        reload=settings.RELOAD,
     )

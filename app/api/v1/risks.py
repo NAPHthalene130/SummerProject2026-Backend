@@ -1,9 +1,29 @@
 from fastapi import APIRouter
+from pydantic import BaseModel, Field
 
 from app.modules.lstm.predictor import risk_predictor
+from app.modules.risk_prediction import live_risk_prediction_service
 from app.utils.camera_manager import CameraManager
 
 router = APIRouter()
+
+
+class RoadPredictionInput(BaseModel):
+    segment_id: str
+    name: str = ""
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    road_type: str = "unknown"
+    lane_count: int = Field(default=2, ge=1, le=20)
+    speed_limit: float = Field(default=40, ge=0, le=200)
+    camera_ids: list[str] = Field(default_factory=list)
+    traffic_flow: float = Field(default=60, ge=0)
+    avg_speed: float = Field(default=40, ge=0)
+
+
+class RiskPredictionRequest(BaseModel):
+    segments: list[RoadPredictionInput]
+    selected_segment_id: str | None = None
 
 
 @router.get("/")
@@ -22,6 +42,14 @@ async def get_all_risks():
         "camera_risks": camera_risks_mapped,
         "detailed": risk_predictor.get_detailed_risks(),
     }
+
+
+@router.post("/prediction")
+async def predict_road_risks(request: RiskPredictionRequest):
+    return await live_risk_prediction_service.predict(
+        [item.model_dump() for item in request.segments],
+        selected_segment_id=request.selected_segment_id,
+    )
 
 
 @router.get("/{camera_id}")
