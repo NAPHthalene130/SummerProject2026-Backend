@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     ENABLE_STREAMING: bool = True
     ENABLE_TRAFFIC_ANALYST: bool = True
 
+    # 热重载：开启后 uvicorn 的 watchfiles 会监视整个后端目录（含 logs/、data/orderImg/、__pycache__/），
+    # 任意文件写入都会触发"change detected"并可能在 .py 变更时整进程重启。
+    # 重启需重新加载 YOLO 权重到 GPU、重连 30 路 RTSP，期间 FPS 归零 6~200s —— 这正是"时而卡顿"的根因。
+    # 生产/监控运行必须关闭；开发时可用 SP2026_RELOAD=true 临时开启。
+    RELOAD: bool = False
+
     CORS_ORIGINS: List[str] = ["*"]
 
     model_config = {
