@@ -268,6 +268,15 @@ class BatchDetector:
         self._prev_positions[cam_id] = current_positions
 
         if enriched:
+            moving_speeds = [float(item["velocity"]) * 3.6 for item in enriched if float(item["velocity"]) > 0]
+            avg_speed_kmh = float(np.mean(moving_speeds)) if moving_speeds else 0.0
+            CameraDataStore().update_traffic_metrics(
+                cam_id,
+                avg_speed_kmh=avg_speed_kmh,
+                vehicle_count=len(enriched),
+            )
+
+        if enriched:
             try:
                 risk_predictor.process_frame(cam_id, self.frame_counts[cam_id], timestamp_ms, enriched)
             except Exception:

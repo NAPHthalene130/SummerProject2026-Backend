@@ -38,6 +38,11 @@ VALUES (%s, 0)
 """
 
 REQUIRED_COLUMNS = (
+    (
+        "admin_users",
+        "user_work_describe",
+        "ADD COLUMN `user_work_describe` VARCHAR(512) NULL AFTER `user_type`",
+    ),
     ("work_orders", "event_id", "ADD COLUMN `event_id` VARCHAR(64) NULL AFTER `work_order_id`"),
     ("work_orders", "camera_id", "ADD COLUMN `camera_id` VARCHAR(64) NULL AFTER `event_id`"),
     ("work_orders", "camera_name", "ADD COLUMN `camera_name` VARCHAR(255) NULL AFTER `camera_id`"),

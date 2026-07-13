@@ -27,6 +27,21 @@ class UserRepository:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'admin_users'
+              AND column_name = 'user_work_describe'
+            """
+        )
+        row = cursor.fetchone()
+        if int(row["count"] if isinstance(row, dict) else row[0]) == 0:
+            cursor.execute(
+                "ALTER TABLE admin_users "
+                "ADD COLUMN user_work_describe VARCHAR(512) NULL AFTER user_type"
+            )
 
     @staticmethod
     def create_user(user_name: str, user_password: str, user_type: str, user_work_describe: Optional[str] = None) -> UserResponse:

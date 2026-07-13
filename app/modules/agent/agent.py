@@ -228,6 +228,12 @@ class Agent(BaseAgent):
 
     def probe(self) -> dict[str, Any]:
         """轻量探活:对模型服务发起一次极小请求,验证连通性。"""
+        if llm_settings.api_key in {"", "your_api_key_here"}:
+            return {
+                "ok": False,
+                "model": llm_settings.model_name,
+                "detail": "LLM API key is not configured",
+            }
         if not self._llm:
             return {"ok": False, "detail": "LLM 未初始化"}
         try:
