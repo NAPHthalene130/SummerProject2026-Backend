@@ -1,6 +1,8 @@
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -11,6 +13,8 @@ from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "best.pt"
+
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
 
@@ -18,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class YOLODetector:
-    def __init__(self, model_path: str = "best.pt"):
+    def __init__(self, model_path: str | None = None):
+        model_path = model_path or os.getenv("SP2026_YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH))
         self.model_path = model_path
         self._fps = 0.0
         self._frame_count = 0
