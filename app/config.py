@@ -70,6 +70,28 @@ class Settings(BaseSettings):
     ENABLE_STREAMING: bool = True
     ENABLE_TRAFFIC_ANALYST: bool = True
 
+    # 30-channel RTSP / YOLO pipeline.  Keeping these in BaseSettings makes the
+    # same SP2026_* values work both as real environment variables and in .env.
+    STREAM_FPS: int = Field(default=15, ge=1, le=60)
+    DETECT_RESIZE_WIDTH: int = Field(default=0, ge=0)
+    RTSP_OPEN_TIMEOUT_MS: int = Field(default=5000, ge=1000)
+    RTSP_READ_TIMEOUT_MS: int = Field(default=5000, ge=1000)
+    RTSP_CONNECT_CONCURRENCY: int = Field(default=4, ge=1, le=30)
+    RTSP_RECONNECT_DELAY: float = Field(default=1.0, ge=0.1)
+    RTSP_MAX_RECONNECT_DELAY: float = Field(default=30.0, ge=0.1)
+    RTSP_STARTUP_SPREAD_SECONDS: float = Field(default=2.0, ge=0.0)
+    RTSP_STALE_FRAME_SECONDS: float = Field(default=6.0, ge=1.0)
+    PROCESSED_STALE_FRAME_SECONDS: float = Field(default=8.0, ge=1.0)
+    RTSP_HW_ACCELERATION: bool = False
+
+    YOLO_MODEL_PATH: str = ""
+    YOLO_BATCH_SIZE: int = Field(default=8, ge=1)
+    YOLO_POST_WORKERS: int = Field(default=8, ge=1, le=64)
+    OPENCV_THREADS: int = Field(default=1, ge=1, le=16)
+    YOLO_BATCH_COLLECT_MS: float = Field(default=8.0, ge=0.0, le=100.0)
+    YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
+    YOLO_HALF: bool = True
+
     # 热重载：开启后 uvicorn 的 watchfiles 会监视整个后端目录（含 logs/、data/orderImg/、__pycache__/），
     # 任意文件写入都会触发"change detected"并可能在 .py 变更时整进程重启。
     # 重启需重新加载 YOLO 权重到 GPU、重连 30 路 RTSP，期间 FPS 归零 6~200s —— 这正是"时而卡顿"的根因。

@@ -3,6 +3,7 @@ import time
 from fractions import Fraction
 
 import av
+import cv2
 import numpy as np
 
 from aiortc import VideoStreamTrack
@@ -22,29 +23,70 @@ class ProcessedVideoTrack(VideoStreamTrack):
         self._pts = 0
         self._next_frame_time: float | None = None
         self._last_frame_id: int = -1
-        self._first_frame = True
+        self._last_source_frame: np.ndarray | None = None
+        self._cached_video_frame: av.VideoFrame | None = None
+        self._offline_frames: dict[str, av.VideoFrame] = {}
 
     async def recv(self) -> av.VideoFrame:
         now = time.perf_counter()
-        if self._next_frame_time is not None:
+        if self._next_frame_time is None:
+            self._next_frame_time = now
+        else:
             delay = self._next_frame_time - now
             if delay > 0:
                 await asyncio.sleep(delay)
 
-        self._next_frame_time = time.perf_counter() + FRAME_INTERVAL
+        send_time = time.perf_counter()
+        if send_time - self._next_frame_time > FRAME_INTERVAL * 2:
+            # Drop accumulated timing debt after an encoder or event-loop stall.
+            self._next_frame_time = send_time
+        self._next_frame_time += FRAME_INTERVAL
 
-        frame_rgb, frame_id = self._stream.get_latest_frame()
+        # CameraStream replaces processed arrays atomically and never mutates an
+        # already published one, so WebRTC does not need another full-frame copy.
+        frame_rgb, frame_id = self._stream.get_latest_frame(copy=False)
         if frame_rgb is None:
-            frame_rgb = np.zeros((TEST_FRAME_H, TEST_FRAME_W, 3), dtype=np.uint8)
+            state = self._stream.connection_state
+            video_frame = self._offline_frames.get(state)
+            if video_frame is None:
+                video_frame = self._make_offline_frame(state)
+                self._offline_frames[state] = video_frame
+            self._last_source_frame = None
+            self._last_frame_id = -1
+            self._cached_video_frame = None
+        else:
+            is_new = (
+                frame_id != self._last_frame_id
+                or frame_rgb is not self._last_source_frame
+                or self._cached_video_frame is None
+            )
+            if is_new:
+                self._cached_video_frame = av.VideoFrame.from_ndarray(
+                    frame_rgb,
+                    format="rgb24",
+                )
+                self._last_frame_id = frame_id
+                self._last_source_frame = frame_rgb
+            video_frame = self._cached_video_frame
 
-        video_frame = av.VideoFrame.from_ndarray(frame_rgb, format="rgb24")
         video_frame.pts = self._pts
         video_frame.time_base = Fraction(1, 90000)
-
-        if self._first_frame:
-            video_frame.pict_type = av.video.frame.PictureType.I
-            self._first_frame = False
-
         self._pts += PTS_STEP
-
         return video_frame
+
+    @staticmethod
+    def _make_offline_frame(state: str) -> av.VideoFrame:
+        frame_rgb = np.zeros((TEST_FRAME_H, TEST_FRAME_W, 3), dtype=np.uint8)
+        frame_rgb[:] = (18, 20, 24)
+        label = f"STREAM {state.upper()}"
+        cv2.putText(
+            frame_rgb,
+            label,
+            (48, TEST_FRAME_H // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (210, 210, 210),
+            2,
+            cv2.LINE_AA,
+        )
+        return av.VideoFrame.from_ndarray(frame_rgb, format="rgb24")
