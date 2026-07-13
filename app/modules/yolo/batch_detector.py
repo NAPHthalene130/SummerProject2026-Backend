@@ -1,15 +1,15 @@
-"""批量推理调度器：编排冷启动、推理、回传模块"""
+"""批量推理调度器：编排冷启动、推理、回传模块（含并发后处理）"""
 
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
 import numpy as np
-import supervision as sv
 
-from app.modules.camera_data import CameraDataStore
+from app.modules.camera_data import CameraDataStore, BoundingBoxItem
 from app.modules.lstm.predictor import risk_predictor
 from app.modules.yolo.cold_start import load_model
 from app.modules.yolo.inference import FrameProcessor
@@ -17,6 +17,9 @@ from app.modules.yolo.inference import FrameProcessor
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 8
+POST_WORKERS = 4
+YOLO_IMSZ = 640
+USE_HALF = False
 
 
 class BatchDetector:
@@ -32,78 +35,139 @@ class BatchDetector:
         return cls._instance
 
     def _init(self, model_path: str) -> None:
+        cv2.setNumThreads(2)
         self.model, self.device = load_model(model_path)
         self.class_names = self.model.names
+        self._use_half = USE_HALF and self.device != "cpu"
+
         self._streams: dict[str, object] = {}
-        self._pending_frames: dict[str, np.ndarray] = {}
+        self._streams_lock = threading.RLock()
+        self._pending: dict[str, np.ndarray] = {}
+        self._post_inflight: set[str] = set()
         self._pending_lock = threading.Lock()
+        self._pending_event = threading.Event()
         self._processors: dict[str, FrameProcessor] = {}
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._post_pool: Optional[ThreadPoolExecutor] = None
         self._fps = 0.0
-        self._total_processed = 0
-        self._last_fps_time = time.perf_counter()
+        self._window_total = 0
+        self._lifetime_total = 0
+        self._last_fps = time.perf_counter()
+        self._metrics_lock = threading.Lock()
 
     def register_stream(self, cam_id: str, stream: object) -> None:
-        self._streams[cam_id] = stream
+        with self._streams_lock:
+            self._streams[cam_id] = stream
 
     def unregister_stream(self, cam_id: str) -> None:
-        self._streams.pop(cam_id, None)
+        with self._streams_lock:
+            self._streams.pop(cam_id, None)
         with self._pending_lock:
-            self._pending_frames.pop(cam_id, None)
-        self._processors.pop(cam_id, None)
+            self._pending.pop(cam_id, None)
+            inflight = cam_id in self._post_inflight
+        if not inflight:
+            self._processors.pop(cam_id, None)
 
     def submit(self, cam_id: str, frame: np.ndarray) -> None:
         with self._pending_lock:
-            self._pending_frames[cam_id] = frame.copy()
+            self._pending[cam_id] = frame.copy()
+        self._pending_event.set()
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS, thread_name_prefix="yolo-post")
+        self._thread = threading.Thread(target=self._loop, name="yolo-infer", daemon=True)
         self._thread.start()
-        logger.info("BatchDetector started (batch_size=%d)", BATCH_SIZE)
+        logger.info("BatchDetector started (batch=%d, post=%d, half=%s)", BATCH_SIZE, POST_WORKERS, self._use_half)
 
     def stop(self) -> None:
         self._running = False
+        self._pending_event.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
+        if self._post_pool is not None:
+            self._post_pool.shutdown(wait=True, cancel_futures=True)
+            self._post_pool = None
+        with self._pending_lock:
+            self._pending.clear()
+            self._post_inflight.clear()
+        logger.info("BatchDetector stopped (total=%d, fps=%.1f)", self._lifetime_total, self._fps)
 
     def _loop(self) -> None:
+        kw = {"half": True} if self._use_half else {}
         while self._running:
-            batch_ids: list[str] = []
-            batch_frames: list[np.ndarray] = []
-            with self._pending_lock:
-                items = list(self._pending_frames.items())
-                self._pending_frames.clear()
-            for cid, frame in items:
-                if cid not in self._streams:
-                    continue
-                batch_ids.append(cid)
-                batch_frames.append(frame)
-                if len(batch_frames) >= BATCH_SIZE:
-                    self._process_batch(batch_ids, batch_frames)
-                    batch_ids, batch_frames = [], []
-            if batch_frames:
-                self._process_batch(batch_ids, batch_frames)
-            time.sleep(0.01)
+            self._pending_event.wait(timeout=0.05)
+            if not self._running:
+                break
+            items = self._take_batch()
+            if not items:
+                continue
+            frames = [f for _, f in items]
+            try:
+                results = self.model(frames, imgsz=YOLO_IMSZ, device=self.device, verbose=False, **kw)
+            except Exception as e:
+                logger.error("Batch infer error: %s", e)
+                for cid, _ in items:
+                    self._release_inflight(cid)
+                continue
+            for (cid, frame), result in zip(items, results):
+                try:
+                    if self._post_pool:
+                        self._post_pool.submit(self._postprocess_job, cid, frame, result)
+                    else:
+                        self._postprocess_job(cid, frame, result)
+                except RuntimeError:
+                    self._release_inflight(cid)
 
-    def _process_batch(self, cam_ids: list[str], frames: list[np.ndarray]) -> None:
+    def _take_batch(self) -> list[tuple[str, np.ndarray]]:
+        selected: list[tuple[str, np.ndarray]] = []
+        with self._pending_lock:
+            for cid in list(self._pending):
+                if cid in self._post_inflight:
+                    continue
+                if cid not in self._streams:
+                    self._pending.pop(cid, None)
+                    continue
+                frame = self._pending.pop(cid)
+                self._post_inflight.add(cid)
+                selected.append((cid, frame))
+                if len(selected) >= BATCH_SIZE:
+                    break
+            has_left = any(c not in self._post_inflight for c in self._pending)
+            if has_left:
+                self._pending_event.set()
+            else:
+                self._pending_event.clear()
+        return selected
+
+    def _postprocess_job(self, cam_id: str, frame: np.ndarray, result) -> None:
         try:
-            results = self.model(frames, imgsz=640, device=self.device, verbose=False)
-            for i, (cid, frame) in enumerate(zip(cam_ids, frames)):
-                self._process_single(cid, frame, results[i])
-            self._total_processed += len(frames)
-            now = time.perf_counter()
-            if now - self._last_fps_time >= 5.0:
-                self._fps = self._total_processed / (now - self._last_fps_time)
-                self._total_processed = 0
-                self._last_fps_time = now
-                logger.info("BatchDetector FPS: %.1f (%d cameras)", self._fps, len(self._streams))
+            self._process_single(cam_id, frame, result)
         except Exception as e:
-            logger.error("Batch error: %s", e)
+            logger.error("Post-process error [%s]: %s", cam_id, e)
+        finally:
+            self._release_inflight(cam_id)
+            with self._metrics_lock:
+                self._window_total += 1
+                self._lifetime_total += 1
+                now = time.perf_counter()
+                if now - self._last_fps >= 5.0:
+                    self._fps = self._window_total / (now - self._last_fps)
+                    self._window_total = 0
+                    self._last_fps = now
+
+    def _release_inflight(self, cam_id: str) -> None:
+        with self._pending_lock:
+            self._post_inflight.discard(cam_id)
+            has_pending = cam_id in self._pending
+        if cam_id not in self._streams:
+            self._processors.pop(cam_id, None)
+        if has_pending:
+            self._pending_event.set()
 
     def _process_single(self, cam_id: str, frame: np.ndarray, result) -> None:
         if cam_id not in self._processors:
@@ -115,12 +179,12 @@ class BatchDetector:
 
         dlist, annotated, stats = fp.process(self.model, frame, self.device, result)
 
-        stream = self._streams.get(cam_id)
+        with self._streams_lock:
+            stream = self._streams.get(cam_id)
         if stream is not None:
             stream.set_processed_frame(annotated)
 
         if dlist:
-            import time
             ts = int(time.time() * 1000)
             enriched = []
             for d in dlist:
@@ -131,10 +195,8 @@ class BatchDetector:
                 vel = prev.get("_vel", 0.0)
                 hp = 0.0
                 if len(dlist) > 1:
-                    others = [o for o in dlist if o["track_id"] != tid]
-                    if others:
-                        ob = others[0]["bbox"]
-                        hp = abs(cy - (ob[1] + ob[3]) / 2) * 0.05
+                    ob = dlist[1]["bbox"]
+                    hp = abs(cy - (ob[1] + ob[3]) / 2) * 0.05
                 enriched.append({
                     "track_id": tid, "frame_id": fp.frame_count, "timestamp_ms": ts,
                     "section_id": 1 if prev.get("cx", cx) > cx else 0,
@@ -142,10 +204,17 @@ class BatchDetector:
                     "acceleration": 0.0, "preceding_id": -1, "space_headway": hp,
                 })
             try:
-                from app.modules.lstm.predictor import risk_predictor
                 risk_predictor.process_frame(cam_id, fp.frame_count, ts, enriched)
             except Exception:
                 pass
+
+        # 更新平均车速到CameraDataStore
+        speeds = [d["velocity"] for d in enriched]
+        if speeds:
+            avg_kmh = float(np.mean(speeds)) * 3.6
+            CameraDataStore().update_traffic_metrics(
+                cam_id, avg_speed_kmh=avg_kmh, vehicle_count=len(dlist),
+            )
 
     def get_traffic_flow(self, cam_id: str) -> dict:
         fp = self._processors.get(cam_id)
