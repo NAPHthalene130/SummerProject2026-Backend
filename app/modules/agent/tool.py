@@ -27,6 +27,7 @@ def _get_vlm_client() -> OpenAI:
         _vlm_client = OpenAI(
             base_url=llm_settings.url,
             api_key=llm_settings.api_key,
+            timeout=60.0,
         )
     return _vlm_client
 
@@ -209,7 +210,7 @@ def query_work_orders(
 ) -> str:
     """查询工单列表,支持按用户、状态、等级筛选。
     user_id: 可选,筛选该人员对应类别的工单
-    stage: 可选,工单阶段(unassigned/pending/processing/completed/ignored),默认返回所有未完成
+    stage: 可选,工单阶段(unassigned/pending/processing/completed/ignored)。未指定时默认返回所有未结案(排除completed/ignored)
     event_level: 可选,事件等级(low/medium/high)
     limit: 返回数量上限,默认20条"""
     try:
@@ -220,10 +221,12 @@ def query_work_orders(
 
     if stage:
         work_orders = [wo for wo in work_orders if wo.status == stage]
+    else:
+        work_orders = [
+            wo for wo in work_orders if wo.status not in ("completed", "ignored")
+        ]
     if event_level:
         work_orders = [wo for wo in work_orders if wo.event_level == event_level]
-    if user_id is None and stage is None:
-        work_orders = [wo for wo in work_orders if wo.status not in ("completed", "ignored")]
 
     work_orders = work_orders[:limit]
 
@@ -330,7 +333,8 @@ def query_work_order_stats() -> str:
 def suggest_handling(work_order_id: str) -> str:
     """分析指定工单并生成处置建议上下文(JSON)。
     未派发→推荐人员与优先级,待处理→处置步骤,处理中→升级条件,已完成/忽略→复盘。
-    自动加载工单关联的现场照片,调用视觉模型分析画面内容,将分析结果一并返回。"""
+    自动加载工单关联的现场照片,调用视觉模型分析画面内容,将分析结果一并返回。
+    注意:本工具含图片识别,耗时约5-15秒;返回的是上下文JSON,需由你据此组织最终中文建议(3-5条步骤)。"""
     try:
         wo = WorkOrderRepository.get_work_order(work_order_id)
     except Exception as exc:
@@ -434,28 +438,47 @@ def dispatch_work_order(work_order_id: str, user_id: int) -> str:
     }, ensure_ascii=False)
 
 
-def batch_dispatch_unassigned() -> str:
-    """批量派发:将所有未派发(unassigned)工单自动匹配同类别负载最低的人员并派发。
-    无需参数,自动完成查询→匹配→派发全流程,返回每条工单的派发结果摘要。"""
-    all_orders = WorkOrderRepository.list_work_orders()
-    unassigned = [wo for wo in all_orders if wo.status == "unassigned"]
+def _select_best_staff(
+    staff_list: list[Any],
+    category: str,
+    workload_override: dict[int, int],
+) -> Optional[Any]:
+    """在同类别人员中选取(当前负载+本批次已派发增量)最低者,实现批次内负载均衡。"""
+    candidates = [s for s in staff_list if s.personnel_category == category]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda s: (
+            s.work_order_count + workload_override.get(int(s.id), 0),
+            s.distance_km,
+        ),
+    )
 
-    if not unassigned:
-        return json.dumps({"message": "当前没有未派发工单", "total": 0}, ensure_ascii=False)
 
-    staff_list = WorkOrderRepository.list_staff()
-    if not staff_list:
-        return json.dumps({"error": "无可派发人员", "total_unassigned": len(unassigned)}, ensure_ascii=False)
+_BATCH_PRESENTATION_HINT = (
+        "请用1-2句话回复,例如:'区间300~330内共派发28单,跳过0单,失败0单。'"
+        "禁止输出Markdown表格或'结论/依据/未核验项'等结构。"
+    )
 
+
+def _dispatch_unassigned_orders(
+    orders: list[Any], staff_list: list[Any]
+) -> dict[str, Any]:
+    """对给定的未派发工单逐个匹配同类别负载最低人员并派发,返回汇总结果。
+
+    workload_override 在批次内累加,避免所有工单都压到同一人(修正单次快照不刷新的负载均衡问题)。
+    """
     results: list[dict[str, Any]] = []
     success_count = 0
     skip_count = 0
     fail_count = 0
+    workload_override: dict[int, int] = {}
 
-    for wo in unassigned:
+    for wo in orders:
         category = wo.required_category or "traffic_police"
-        candidates = [s for s in staff_list if s.personnel_category == category]
-        if not candidates:
+        best = _select_best_staff(staff_list, category, workload_override)
+        if best is None:
             results.append({
                 "work_order_id": wo.work_order_id,
                 "type": wo.accident_info,
@@ -467,7 +490,6 @@ def batch_dispatch_unassigned() -> str:
             skip_count += 1
             continue
 
-        best = min(candidates, key=lambda s: s.work_order_count)
         try:
             dispatch_result = WorkOrderRepository.dispatch_work_order(
                 str(wo.work_order_id), int(best.id)
@@ -484,7 +506,7 @@ def batch_dispatch_unassigned() -> str:
             fail_count += 1
             continue
         except Exception as exc:
-            logger.exception("batch_dispatch 派发异常 work_order=%s", wo.work_order_id)
+            logger.exception("batch dispatch 派发异常 work_order=%s", wo.work_order_id)
             results.append({
                 "work_order_id": wo.work_order_id,
                 "result": "failed",
@@ -507,23 +529,88 @@ def batch_dispatch_unassigned() -> str:
                 "level": dispatch_result.event_level,
                 "assigned_to": dispatch_result.assignee,
                 "staff_id": int(best.id),
-                "workload": best.work_order_count,
                 "result": "success",
             })
             success_count += 1
+            workload_override[int(best.id)] = workload_override.get(int(best.id), 0) + 1
 
-    return json.dumps({
-        "total_unassigned": len(unassigned),
+    return {
+        "total": len(orders),
         "success": success_count,
         "skipped": skip_count,
         "failed": fail_count,
         "details": results,
-    }, ensure_ascii=False)
+        "presentation_hint": _BATCH_PRESENTATION_HINT,
+    }
+
+
+def batch_dispatch_unassigned() -> str:
+    """批量派发:将所有未派发(unassigned)工单自动匹配同类别负载最低的人员并派发。
+    无需参数,自动完成查询→匹配→派发全流程,返回每条工单的派发结果摘要。
+    适用于"批量处理/全部派发/批量派发"等不指定编号范围的批量指令——调用一次即可,不要逐个派发。"""
+    try:
+        all_orders = WorkOrderRepository.list_work_orders()
+        staff_list = WorkOrderRepository.list_staff()
+    except Exception as exc:
+        logger.exception("batch_dispatch_unassigned 查询失败")
+        return json.dumps({"error": f"批量派发查询失败: {exc}", "data": None}, ensure_ascii=False)
+
+    unassigned = [wo for wo in all_orders if wo.status == "unassigned"]
+    if not unassigned:
+        return json.dumps({"message": "当前没有未派发工单", "total": 0, "success": 0}, ensure_ascii=False)
+    if not staff_list:
+        return json.dumps({"error": "无可派发人员", "total": len(unassigned)}, ensure_ascii=False)
+
+    summary = _dispatch_unassigned_orders(unassigned, staff_list)
+    return json.dumps(summary, ensure_ascii=False)
+
+
+def dispatch_work_order_range(start_id: int, end_id: int) -> str:
+    """批量派发指定编号区间内的所有未派发工单(自动按类别匹配负载最低人员)。
+    start_id: 起始工单编号(含),如 300
+    end_id: 结束工单编号(含),如 330
+    一次性派发区间内所有 unassigned 工单;非 unassigned 状态自动跳过。
+    适用于"把300~330的工单派发"这类指定编号区间的批量指令——调用一次即可,不要逐个展开派发。"""
+    lo, hi = sorted((int(start_id), int(end_id)))
+    try:
+        all_orders = WorkOrderRepository.list_work_orders()
+        staff_list = WorkOrderRepository.list_staff()
+    except Exception as exc:
+        logger.exception("dispatch_work_order_range 查询失败")
+        return json.dumps({"error": f"区间派发查询失败: {exc}", "data": None}, ensure_ascii=False)
+
+    in_range: list[Any] = []
+    for wo in all_orders:
+        try:
+            num = parse_work_order_id(wo.work_order_id)
+        except (ValueError, TypeError):
+            continue
+        if lo <= num <= hi and wo.status == "unassigned":
+            in_range.append(wo)
+
+    if not in_range:
+        return json.dumps({
+            "message": f"区间 {lo}~{hi} 内没有未派发工单",
+            "range": [lo, hi],
+            "total": 0,
+            "success": 0,
+        }, ensure_ascii=False)
+    if not staff_list:
+        return json.dumps({
+            "error": "无可派发人员",
+            "range": [lo, hi],
+            "total": len(in_range),
+        }, ensure_ascii=False)
+
+    summary = _dispatch_unassigned_orders(in_range, staff_list)
+    summary["range"] = [lo, hi]
+    return json.dumps(summary, ensure_ascii=False)
 
 
 def answer_general_question(question: str) -> str:
     """回答交通管理法规、工单处置流程等通用问题。
-    从法规知识库检索相关条款作为回答依据。"""
+    本工具仅从法规知识库检索相关条款作为依据(返回rag_references),不直接生成最终答案;
+    需由你据此组织最终中文回答,并在无匹配时说明"知识库未检索到相关条款"。"""
     rag_articles: list[dict[str, str]] = []
     try:
         rag_result = _search_regulations(question)
@@ -553,5 +640,6 @@ TOOLS = [
     suggest_handling,
     dispatch_work_order,
     batch_dispatch_unassigned,
+    dispatch_work_order_range,
     answer_general_question,
 ]

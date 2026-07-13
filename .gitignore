@@ -39,6 +39,10 @@ data/models/*
 app/data/orderImg/*
 !app/data/orderImg/.gitkeep
 
+# RAG vector store (built artifacts)
+app/modules/agent/rag/chroma_db/*/
+!app/modules/agent/rag/chroma_db/.gitkeep
+
 # Logs
 *.log
 logs/

@@ -1,8 +1,10 @@
+import json
 import logging
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.modules.agent.agent import Agent
@@ -43,25 +45,79 @@ async def chat(request: ChatRequest) -> ChatResponse:
         agent = Agent()
         reply = await agent.chat(request.message, thread_id=thread_id)
         return ChatResponse(reply=reply, thread_id=thread_id)
+    except RuntimeError as exc:
+        logger.exception("Agent chat failed")
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         logger.exception("Agent chat failed")
         raise HTTPException(status_code=500, detail=f"Agent处理异常: {exc}")
 
 
+@agent_router.post("/chat/stream", summary="Agent流式对话(SSE)")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """流式返回Agent回复,通过SSE推送工具执行进度与文本token。
+
+    SSE事件(data行,JSON):
+    - {"type":"tool_start","name":"..."} 工具开始执行
+    - {"type":"tool_end","name":"...","preview":"..."} 工具执行完毕(含结果摘要)
+    - {"type":"token","content":"..."} 模型文本片段
+    - {"type":"error","content":"..."} 错误
+    - {"type":"done","thread_id":"...","reply":"..."} 结束(含完整回复与会话ID)
+    """
+    thread_id = request.thread_id or str(uuid.uuid4())
+    agent = Agent()
+
+    async def event_generator():
+        full_reply: list[str] = []
+        try:
+            async for evt in agent.astream(request.message, thread_id=thread_id):
+                if evt.get("type") == "token":
+                    full_reply.append(evt.get("content", ""))
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception("Agent stream failed")
+            err = {"type": "error", "content": f"Agent处理异常: {exc}"}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        finally:
+            done = {
+                "type": "done",
+                "thread_id": thread_id,
+                "reply": "".join(full_reply),
+            }
+            yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @agent_router.get("/health", summary="Agent健康检查")
 async def health() -> dict:
-    """检查Agent是否可用。"""
+    """检查Agent是否可用,包含对模型服务的轻量探活。"""
     try:
         agent = Agent()
+        probe = agent.probe()
         return {
-            "status": "healthy",
+            "status": "healthy" if probe.get("ok") else "degraded",
+            "model": probe.get("model"),
             "tools": agent.tools,
+            "detail": probe.get("detail"),
         }
     except Exception as exc:
-        return {
-            "status": "unhealthy",
-            "error": str(exc),
-        }
+        return {"status": "unhealthy", "error": str(exc)}
+
+
+@agent_router.delete("/session/{thread_id}", summary="清除指定会话记忆")
+async def clear_session(thread_id: str) -> dict:
+    """清除指定thread_id的对话上下文,开启全新会话。"""
+    try:
+        Agent().clear_memory(thread_id)
+        return {"status": "ok", "thread_id": thread_id}
+    except Exception as exc:
+        logger.exception("clear session failed")
+        raise HTTPException(status_code=500, detail=f"清除会话失败: {exc}")
 
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -71,8 +127,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "query_staff": "查询所有可派发人员信息及空闲状态",
     "query_work_order_stats": "查询工单统计数据,按状态和等级汇总",
     "suggest_handling": "分析工单并基于当前状态生成分阶段处置建议",
-    "dispatch_work_order": "将工单派发给指定人员",
-    "batch_dispatch_unassigned": "批量派发:自动将所有未派发工单按类别匹配最优人员并派发",
+    "dispatch_work_order": "将单个工单派发给指定人员",
+    "batch_dispatch_unassigned": "批量派发:自动将所有未派发工单按类别匹配最优人员并派发(不指定编号范围)",
+    "dispatch_work_order_range": "区间派发:派发指定编号区间(如300~330)内的所有未派发工单",
     "answer_general_question": "回答交通管理法规和处置流程等通用问题",
 }
 
