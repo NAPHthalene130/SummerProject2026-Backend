@@ -51,8 +51,7 @@ class _CacheEntry:
 
 class LiveRiskPredictionService:
     def __init__(self) -> None:
-        workspace = Path(__file__).resolve().parents[4]
-        default_model = workspace / "traffic_predict" / "models" / "catboost_risk_model.joblib"
+        default_model = Path(__file__).resolve().parent / "models" / "catboost_risk_model.joblib"
         self.model_path = Path(os.getenv("SP2026_RISK_MODEL_PATH", str(default_model)))
         self._model: Any | None = None
         self._model_lock = threading.Lock()

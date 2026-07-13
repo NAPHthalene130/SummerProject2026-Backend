@@ -1,6 +1,8 @@
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -17,17 +19,19 @@ BATCH_SIZE = 8
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "best.pt"
+
 
 class BatchDetector:
     _instance: Optional["BatchDetector"] = None
     _instance_lock = threading.Lock()
 
-    def __new__(cls, model_path: str = "best.pt") -> "BatchDetector":
+    def __new__(cls, model_path: str | None = None) -> "BatchDetector":
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-                    cls._instance._init(model_path)
+                    cls._instance._init(model_path or os.getenv("SP2026_YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
         return cls._instance
 
     def _init(self, model_path: str) -> None:
