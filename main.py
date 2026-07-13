@@ -4,8 +4,13 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# RTSP 低延迟选项：TCP 传输（避免 UDP 丢包卡顿）+ 关闭分析/减小缓冲，降低端到端延迟
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;512K"
+)
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+# 可选硬件解码：设置 SP2026_HW_DECODER=1 并安装支持 NVDEC 的 OpenCV/ffmpeg 时启用
+os.environ.setdefault("SP2026_HW_DECODER", "0")
 
 import av
 import uvicorn
