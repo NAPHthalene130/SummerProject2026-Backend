@@ -7,7 +7,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.models.camera import CameraResponse, CameraStatsItem, CameraStatsResponse
-from app.modules.yolo import CameraDataStore, BatchDetector
+from app.modules.camera_data import CameraDataStore
+from app.modules.yolo import BatchDetector
 from app.utils.camera_manager import CameraManager
 
 cameras_router = APIRouter()
