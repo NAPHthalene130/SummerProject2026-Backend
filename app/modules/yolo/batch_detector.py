@@ -82,6 +82,9 @@ class BatchDetector:
         self._prev_positions: dict[str, dict[int, dict]] = {}
         self._prev_velocities: dict[str, dict[int, float]] = {}
         self._prev_timestamps: dict[str, int] = {}
+        self._trajectories: dict[str, dict[int, list]] = {}
+        self._speed_last_update: dict[str, dict[int, float]] = {}
+        self._speed_stable: dict[str, dict[int, float]] = {}
         self.PIXEL_TO_METER = 0.05
 
     def register_stream(self, cam_id: str, stream: object) -> None:
@@ -197,6 +200,7 @@ class BatchDetector:
 
         self.frame_counts[cam_id] += 1
         now = time.time()
+        now_ms = now * 1000
 
         detections = sv.Detections.from_ultralytics(result)
 
@@ -269,6 +273,13 @@ class BatchDetector:
         if cam_id not in self._prev_velocities:
             self._prev_velocities[cam_id] = {}
 
+        if cam_id not in self._trajectories:
+            self._trajectories[cam_id] = {}
+        if cam_id not in self._speed_last_update:
+            self._speed_last_update[cam_id] = {}
+        if cam_id not in self._speed_stable:
+            self._speed_stable[cam_id] = {}
+
         current_positions: dict[int, dict] = {}
         enriched: list[dict] = []
 
@@ -281,17 +292,55 @@ class BatchDetector:
             cy = (bbox[1] + bbox[3]) / 2
             current_positions[track_id] = {"cx": cx, "cy": cy}
 
-            prev = self._prev_positions[cam_id].get(track_id)
-            if prev:
-                dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
-                vel = (dp * self.PIXEL_TO_METER) / dt_sec
-            else:
-                vel = 0.0
+            traj = self._trajectories[cam_id].setdefault(track_id, [])
+            traj.append((cx, cy, now))
+            cutoff = now - 1.5
+            self._trajectories[cam_id][track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
+
+            vel = 0.0
+            last_update = self._speed_last_update[cam_id].get(track_id, 0.0)
+            stable = self._speed_stable[cam_id].get(track_id, 0.0)
+            if now - last_update >= 0.5:
+                pts = self._trajectories[cam_id][track_id]
+                if len(pts) >= 5:
+                    xs = np.array([p[0] for p in pts])
+                    ys = np.array([p[1] for p in pts])
+                    ts = np.array([p[2] for p in pts])
+                    dt_total = ts[-1] - ts[0]
+                    if dt_total > 0.3:
+                        dx_total = xs[-1] - xs[0]
+                        if abs(dx_total) > 5:
+                            try:
+                                coeffs = np.polyfit(ts, xs, 1)
+                                speed_px = abs(coeffs[0])
+                            except np.linalg.LinAlgError:
+                                speed_px = abs(dx_total) / dt_total
+                        else:
+                            speed_px = abs(dx_total) / max(dt_total, 0.01)
+                        vel = speed_px * self.PIXEL_TO_METER
+                        vel_kmh = vel * 3.6
+                        if stable > 0 and abs(vel_kmh - stable) < 5:
+                            vel_kmh = stable
+                        self._speed_stable[cam_id][track_id] = vel_kmh
+                        self._speed_last_update[cam_id][track_id] = now
+                    else:
+                        prev = self._prev_positions[cam_id].get(track_id)
+                        if prev:
+                            dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
+                            vel = (dp * self.PIXEL_TO_METER) / max(dt_sec, 0.01)
+                else:
+                    prev = self._prev_positions[cam_id].get(track_id)
+                    if prev:
+                        dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
+                        vel = (dp * self.PIXEL_TO_METER) / max(dt_sec, 0.01)
+
+            vel_kmh = self._speed_stable[cam_id].get(track_id, vel * 3.6)
             prev_vel = self._prev_velocities[cam_id].get(track_id, vel)
-            acc = (vel - prev_vel) / dt_sec
+            acc = (vel - prev_vel) / max(dt_sec, 0.01)
 
             section_id = 0
-            if prev and cx < prev["cx"]:
+            prev_pos = self._prev_positions[cam_id].get(track_id)
+            if prev_pos and cx < prev_pos["cx"]:
                 section_id = 1
 
             preceding_id, headway = -1, 0.0
@@ -318,7 +367,7 @@ class BatchDetector:
             })
 
             self._prev_velocities[cam_id][track_id] = vel
-            speed_map[track_id] = vel * 3.6
+            speed_map[track_id] = vel_kmh
 
         self._prev_positions[cam_id] = current_positions
 
