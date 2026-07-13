@@ -193,7 +193,7 @@ class FrameProcessor:
                 dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
                 scale = self._perspective_scale(cy)
                 vel_kmh = dp * PIXEL_TO_METER * scale * 3.6 * 30
-            self._prev_positions[track_id] = {"cx": cx, "cy": cy}
+            self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
             self._speed_last_update[track_id] = now
             if vel_kmh < 0.5:
                 vel_kmh = 0.0
@@ -205,7 +205,7 @@ class FrameProcessor:
         ts = np.array([p[2] for p in pts])
         dt = ts[-1] - ts[0]
         if dt < 0.2:
-            self._prev_positions[track_id] = {"cx": cx, "cy": cy}
+            self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
             return vel_kmh
 
         try:
@@ -226,7 +226,7 @@ class FrameProcessor:
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
-        self._prev_positions[track_id] = {"cx": cx, "cy": cy}
+        self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": new_kmh, "_vel_mps": new_kmh / 3.6}
         return new_kmh
 
     def _update_store(self, detection_list: list[dict], speed_map: dict[int, float]):

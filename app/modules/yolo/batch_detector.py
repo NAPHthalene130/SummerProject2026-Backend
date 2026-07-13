@@ -119,6 +119,34 @@ class BatchDetector:
         if stream is not None:
             stream.set_processed_frame(annotated)
 
+        if dlist:
+            import time
+            ts = int(time.time() * 1000)
+            enriched = []
+            for d in dlist:
+                tid = d["track_id"]
+                b = d["bbox"]
+                cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+                prev = fp._prev_positions.get(tid, {})
+                vel = prev.get("_vel", 0.0)
+                hp = 0.0
+                if len(dlist) > 1:
+                    others = [o for o in dlist if o["track_id"] != tid]
+                    if others:
+                        ob = others[0]["bbox"]
+                        hp = abs(cy - (ob[1] + ob[3]) / 2) * 0.05
+                enriched.append({
+                    "track_id": tid, "frame_id": fp.frame_count, "timestamp_ms": ts,
+                    "section_id": 1 if prev.get("cx", cx) > cx else 0,
+                    "velocity": prev.get("_vel_mps", vel / 3.6),
+                    "acceleration": 0.0, "preceding_id": -1, "space_headway": hp,
+                })
+            try:
+                from app.modules.lstm.predictor import risk_predictor
+                risk_predictor.process_frame(cam_id, fp.frame_count, ts, enriched)
+            except Exception:
+                pass
+
     def get_traffic_flow(self, cam_id: str) -> dict:
         fp = self._processors.get(cam_id)
         if fp is None:
