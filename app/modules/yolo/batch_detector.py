@@ -25,7 +25,10 @@ class BatchDetector:
     _instance: Optional["BatchDetector"] = None
     _instance_lock = threading.Lock()
 
-    def __new__(cls, model_path: str = "best.pt") -> "BatchDetector":
+    MIN_CONFIDENCE = 0.1
+    NMS_OVERLAP = 0.5
+
+    def __new__(cls, model_path: str = "yolo11m-seg.pt") -> "BatchDetector":
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
@@ -51,9 +54,10 @@ class BatchDetector:
             logger.warning("BatchDetector running on CPU (torch import failed)")
         self.model.to(self.device)
         self.class_names = self.model.names
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-        self.model(dummy, imgsz=640, verbose=False)
-        logger.info("YOLO model warm-up complete")
+        for _ in range(2):
+            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            self.model(dummy, imgsz=640, verbose=False, conf=self.MIN_CONFIDENCE)
+        logger.info("YOLO model warm-up complete (device=%s)", self.device)
 
         self._streams: dict[str, object] = {}
         self._pending_frames: dict[str, np.ndarray] = {}
@@ -203,6 +207,35 @@ class BatchDetector:
         now_ms = now * 1000
 
         detections = sv.Detections.from_ultralytics(result)
+
+        conf_mask = np.array([True] * len(detections))
+        if len(detections) > 0 and detections.confidence is not None:
+            conf_mask = detections.confidence >= self.MIN_CONFIDENCE
+            detections = detections[conf_mask]
+
+        if len(detections) > 0 and detections.xyxy is not None:
+            keep = []
+            boxes = detections.xyxy
+            for i in range(len(boxes)):
+                keep_i = True
+                for j in range(i):
+                    if j not in keep:
+                        continue
+                    xi1, yi1, xi2, yi2 = boxes[i]
+                    xj1, yj1, xj2, yj2 = boxes[j]
+                    ix1, iy1 = max(xi1, xj1), max(yi1, yj1)
+                    ix2, iy2 = min(xi2, xj2), min(yi2, yj2)
+                    if ix1 < ix2 and iy1 < iy2:
+                        inter = (ix2 - ix1) * (iy2 - iy1)
+                        area_i = (xi2 - xi1) * (yi2 - yi1)
+                        area_j = (xj2 - xj1) * (yj2 - yj1)
+                        iou = inter / min(area_i, area_j)
+                        if iou > self.NMS_OVERLAP:
+                            keep_i = False
+                            break
+                if keep_i:
+                    keep.append(i)
+            detections = detections[keep]
 
         if len(detections) > 0:
             detections = self.trackers[cam_id].update_with_detections(detections)
@@ -392,7 +425,11 @@ class BatchDetector:
             except Exception:
                 pass
 
-        frame = self.box_annotator.annotate(scene=frame, detections=detections)
+        TRACK_COLORS = [
+            (56, 56, 255), (255, 144, 30), (255, 224, 32),
+            (80, 200, 120), (255, 105, 180), (128, 0, 128),
+            (0, 200, 255), (200, 0, 200), (0, 255, 128), (255, 0, 128),
+        ]
         for i in range(len(detections)):
             if detections.tracker_id is None or i >= len(detections.tracker_id):
                 continue
@@ -402,8 +439,12 @@ class BatchDetector:
             class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
             cls_name = self.class_names.get(class_id, "?")
             spd = speed_map.get(track_id, 0.0)
+            color = TRACK_COLORS[track_id % len(TRACK_COLORS)]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             label = f"{cls_name} {spd:.0f}km/h"
-            cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+            cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
         if cam_id in self.zone_rects:
             self._prune_events(self._entry_events[cam_id], now)
