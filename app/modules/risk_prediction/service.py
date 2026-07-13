@@ -342,7 +342,7 @@ class LiveRiskPredictionService:
 
     @staticmethod
     def _risk_level(score: float) -> str:
-        if score < 0.25:
+        if score < 0.3:
             return "normal"
         if score < 0.5:
             return "busy"
