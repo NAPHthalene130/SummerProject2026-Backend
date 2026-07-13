@@ -2,7 +2,9 @@ import asyncio
 import json
 from typing import List
 
-from fastapi import APIRouter
+import cv2
+import numpy as np
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -65,6 +67,48 @@ class DetectionUpdateRequest(BaseModel):
 
 @cameras_router.post("/boxes/update")
 async def update_detections(req: DetectionUpdateRequest):
+    from app.modules.camera_data import BoundingBoxItem
+    store = CameraDataStore()
+    box_items = [
+        BoundingBoxItem(
+            track_id=b.get("track_id", 0),
+            class_name=b.get("class_name", ""),
+            confidence=b.get("confidence", 0.0),
+            bbox=b.get("bbox", [0, 0, 0, 0]),
+        )
+        for b in req.boxes
+    ]
+    store.update(
+        camera_id=req.camera_id,
+        total_vehicle_count=len(box_items),
+        boxes=box_items,
+    )
+    return {"status": "ok", "count": len(box_items)}
+
+
+@cameras_router.post("/detections/infer")
+async def infer_from_image(camera_id: str = Form(...), image: UploadFile = File(...)):
+    contents = await image.read()
+    np_arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(400, "Invalid image")
+    from app.modules.yolo.batch_detector import BatchDetector
+    detector = BatchDetector()
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = detector.model(frame_rgb, imgsz=640, verbose=False)[0]
+    from app.modules.camera_data import BoundingBoxItem
+    store = CameraDataStore()
+    boxes = []
+    if results.boxes is not None:
+        for i in range(len(results.boxes)):
+            cls_id = int(results.boxes.cls[i])
+            conf = float(results.boxes.confidence[i])
+            x1, y1, x2, y2 = map(int, results.boxes.xyxy[i].tolist())
+            cls_name = detector.class_names.get(cls_id, f"cls_{cls_id}")
+            boxes.append(BoundingBoxItem(track_id=i, class_name=cls_name, confidence=conf, bbox=[x1, y1, x2, y2]))
+    store.update(camera_id=camera_id, total_vehicle_count=len(boxes), boxes=boxes)
+    return {"status": "ok", "count": len(boxes), "boxes": [{"class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox} for b in boxes]}
     from app.modules.camera_data import BoundingBoxItem
     store = CameraDataStore()
     box_items = [
