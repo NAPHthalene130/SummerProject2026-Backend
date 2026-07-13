@@ -17,10 +17,12 @@ os.close(_devnull_fd)
 sys.stderr = os.fdopen(_real_stderr_fd, "w", encoding="utf-8", buffering=1)
 sys.__stderr__ = sys.stderr
 
-# RTSP 选项：仅用 TCP 传输（避免 UDP 丢包）。
+# RTSP 选项：仅用 TCP 传输（避免 UDP 丢包），并限制每路 FFmpeg 解码器为
+# 单线程。30 路各自并行时再由操作系统调度到 8 个 CPU worker，避免每路
+# 都自动创建一整组解码线程造成数百线程争抢。
 # 注意：flags;low_delay / analyzeduration;0 会禁用 B 帧重排序，导致 mp4Tortsp 的含 B 帧码流
 # 持续报 "reference picture missing during reorder" / "co located POCs unavailable" 并刷屏，故不启用。
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
 import av
@@ -30,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
+from app.api.v1.live import close_all_peer_connections
 from app.config import llm_settings, settings
 from app.utils.camera_manager import CameraManager
 from app.modules.agent.traffic_analyst import TrafficAnalyst
@@ -112,8 +115,8 @@ async def lifespan(application: FastAPI):
 
     if traffic_analyst_enabled:
         await TrafficAnalyst().stop()
-    if settings.ENABLE_STREAMING:
-        StreamManager().stop_all()
+    await close_all_peer_connections()
+    StreamManager().stop_all()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
