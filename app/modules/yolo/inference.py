@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE = 0.1
 NMS_OVERLAP = 0.5
-LOST_BUFFER = 30
-TRAIL_MAX_AGE = 60
+LOST_BUFFER = 15        # 降低 ByteTrack 跟踪状态管理开销（原 30）
+TRAIL_MAX_AGE = 30      # 降低轨迹清理频率（原 60）
 PIXEL_TO_METER = 0.05
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
@@ -52,7 +52,7 @@ class FrameProcessor:
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []  # 滑动窗口平滑车道数（30帧≈2s 取众数）
-        self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=30)
+        self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=15)
         # 标注器在 __init__ 中创建一次复用，避免每帧 new 带来的 450 次/s 对象创建与 GC 压力
         self._box_annotator = sv.BoxAnnotator(color=COLOR_PALETTE, thickness=2)
         self._label_annotator = sv.LabelAnnotator(
@@ -123,7 +123,7 @@ class FrameProcessor:
                 cy = (xyxy[1] + xyxy[3]) / 2
 
                 self.trails.setdefault(tid, []).append((cx, cy))
-                if len(self.trails[tid]) > 30:
+                if len(self.trails[tid]) > 15:
                     self.trails[tid].pop(0)
                 self.trail_age[tid] = self.frame_count
 
@@ -217,7 +217,7 @@ class FrameProcessor:
 
         vel_kmh = self._speed_stable.get(track_id, 0.0)
         lu = self._speed_last_update.get(track_id, 0.0)
-        if now - lu < 0.4:
+        if now - lu < 0.6:
             return vel_kmh
 
         if len(pts) < 4:
