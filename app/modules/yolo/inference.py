@@ -37,6 +37,10 @@ COLD_START_KMH = 25.0
 # 算出值高于该 track 的保底值时自动取真实值（不封顶）。
 SPEED_FLOOR_MIN = 20.0
 SPEED_FLOOR_MAX = 27.0
+# 静止判断：raw >= 此阈值视为"本帧有移动"，更新最后移动时间
+STATIC_SPEED_THRESHOLD = 2.0
+# 连续 STATIC_TIMEOUT_SECONDS 秒未移动才判定为静止归零（避免单帧抖动/遮挡误归零）
+STATIC_TIMEOUT_SECONDS = 2.0
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
 
@@ -69,6 +73,8 @@ class FrameProcessor:
         self._speed_stable: dict[int, float] = {}
         # 每 track 的保底速度缓存（20-27 伪随机，基于 track_id 稳定生成）
         self._floor_kmh_cache: dict[int, float] = {}
+        # 每 track 最后一次"有移动"的时间戳，用于 2s 不动才归零判断
+        self._last_moved_time: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []
         # 纯 IoU 跟踪 — 用 numpy 数组存储轨迹（替代 dict，避免 Python 循环和列表推导式 GIL 开销）
@@ -407,8 +413,12 @@ class FrameProcessor:
         scale = self._perspective_scale(avg_cy)
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
-        # 静止判断必须在 EMA 前：静止时不平滑直接归零，避免 EMA 把 0 拉回导致停不下来
-        is_static = new_kmh < 2.0
+        # 静止判断：连续 2s 未移动才归零（避免单帧抖动/遮挡误归零）
+        # 本帧 raw >= 阈值视为有移动，更新最后移动时间；新track默认now不立即归零
+        if new_kmh >= STATIC_SPEED_THRESHOLD:
+            self._last_moved_time[track_id] = now
+        last_moved = self._last_moved_time.get(track_id, now)
+        is_static = (now - last_moved) > STATIC_TIMEOUT_SECONDS
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
         # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
@@ -455,8 +465,12 @@ class FrameProcessor:
         speed_ms = dist_m / dt
         new_kmh = speed_ms * 3.6
 
-        # 静止判断必须在 EMA 前：静止时不平滑直接归零，避免 EMA 把 0 拉回导致停不下来
-        is_static = new_kmh < 2.0
+        # 静止判断：连续 2s 未移动才归零（避免单帧抖动/遮挡误归零）
+        # 本帧 raw >= 阈值视为有移动，更新最后移动时间；新track默认now不立即归零
+        if new_kmh >= STATIC_SPEED_THRESHOLD:
+            self._last_moved_time[track_id] = now
+        last_moved = self._last_moved_time.get(track_id, now)
+        is_static = (now - last_moved) > STATIC_TIMEOUT_SECONDS
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
         # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
