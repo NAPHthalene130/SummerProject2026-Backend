@@ -389,6 +389,9 @@ class FrameProcessor:
         远处车辆因线性 scale 近似误差大，故作为 BEV 未标定时的回退。"""
         traj = self._trajectories.setdefault(track_id, [])
         traj.append((cx, cy, now))
+        # 首次出现的track立即初始化最后移动时间（给2s活跃期再判静止），必须在len(pts)<2的return前
+        if track_id not in self._last_moved_time:
+            self._last_moved_time[track_id] = now
         cutoff = now - 2.0
         self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
         pts = self._trajectories[track_id]
@@ -414,20 +417,16 @@ class FrameProcessor:
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
         # 静止判断：连续 2s 未移动才归零（避免单帧抖动/遮挡误归零）
-        # 本帧 raw >= 阈值视为有移动，更新最后移动时间；新track默认now不立即归零
+        # 本帧 raw >= 阈值视为有移动，更新最后移动时间
         if new_kmh >= STATIC_SPEED_THRESHOLD:
             self._last_moved_time[track_id] = now
         last_moved = self._last_moved_time.get(track_id, now)
         is_static = (now - last_moved) > STATIC_TIMEOUT_SECONDS
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
-        # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
+        # 静止归零；动着的直接用真实速度（不保底，靠消失点法提升精度）
         if is_static:
             new_kmh = 0.0
-        else:
-            floor = self._get_floor_kmh(track_id)
-            if new_kmh < floor:
-                new_kmh = floor
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
@@ -440,6 +439,9 @@ class FrameProcessor:
         远处车辆误差显著低于 _calc_speed_legacy 的线性 scale 近似。"""
         traj = self._trajectories.setdefault(track_id, [])
         traj.append((cx, cy, now))
+        # 首次出现的track立即初始化最后移动时间（给2s活跃期再判静止），必须在len(pts)<2的return前
+        if track_id not in self._last_moved_time:
+            self._last_moved_time[track_id] = now
         cutoff = now - 2.0
         self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
         pts = self._trajectories[track_id]
@@ -466,20 +468,16 @@ class FrameProcessor:
         new_kmh = speed_ms * 3.6
 
         # 静止判断：连续 2s 未移动才归零（避免单帧抖动/遮挡误归零）
-        # 本帧 raw >= 阈值视为有移动，更新最后移动时间；新track默认now不立即归零
+        # 本帧 raw >= 阈值视为有移动，更新最后移动时间
         if new_kmh >= STATIC_SPEED_THRESHOLD:
             self._last_moved_time[track_id] = now
         last_moved = self._last_moved_time.get(track_id, now)
         is_static = (now - last_moved) > STATIC_TIMEOUT_SECONDS
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
-        # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
+        # 静止归零；动着的直接用真实速度（不保底，靠消失点法提升精度）
         if is_static:
             new_kmh = 0.0
-        else:
-            floor = self._get_floor_kmh(track_id)
-            if new_kmh < floor:
-                new_kmh = floor
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
