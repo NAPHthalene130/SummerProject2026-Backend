@@ -79,93 +79,99 @@ class FrameProcessor:
         return 0.6 + ratio * 0.8
 
     def process(self, model, frame: np.ndarray, device, results) -> tuple[list[dict], np.ndarray, dict]:
+        """全 numpy 后处理：不依赖 sv.Detections，所有数组操作释放 GIL。
+
+        关键优化：
+        - 去掉 sv.Detections 构造（GIL 降 ~3ms）
+        - NMS 直接操作 numpy（torchvision 释放 GIL）
+        - IoU 跟踪直接操作 numpy
+        - 简化 draw（去掉 COUNT ZONE 文字，减少 cv2 调用）
+        """
         self.frame_count += 1
         now = time.time()
         _t = [time.perf_counter()]
 
-        # 手动构造 Detections（替代 sv.Detections.from_ultralytics，减少 ~2.5ms GIL）
+        # 1. 从 results 提取 numpy 数组（不构造 sv.Detections，减少 GIL）
         if hasattr(results, 'boxes') and results.boxes is not None and len(results.boxes) > 0:
-            detections = sv.Detections(
-                xyxy=results.boxes.xyxy.cpu().numpy(),
-                confidence=results.boxes.conf.cpu().numpy(),
-                class_id=results.boxes.cls.cpu().numpy().astype(int),
-            )
+            xyxy = results.boxes.xyxy.cpu().numpy().astype(np.float32)
+            conf = results.boxes.conf.cpu().numpy().astype(np.float32)
+            cls = results.boxes.cls.cpu().numpy().astype(np.int32)
         else:
-            detections = sv.Detections.empty()
+            xyxy = np.empty((0, 4), dtype=np.float32)
+            conf = np.empty(0, dtype=np.float32)
+            cls = np.empty(0, dtype=np.int32)
 
-        if len(detections) > 0 and detections.confidence is not None:
-            detections = detections[detections.confidence >= MIN_CONFIDENCE]
-        if len(detections) > 1 and detections.xyxy is not None:
-            detections = self._nms(detections)
+        # 2. 置信度过滤（numpy 布尔索引，释放 GIL）
+        if len(xyxy) > 0:
+            mask = conf >= MIN_CONFIDENCE
+            xyxy, conf, cls = xyxy[mask], conf[mask], cls[mask]
+
+        # 3. NMS（torchvision 释放 GIL）
+        if len(xyxy) > 1 and _TORCHVISION_NMS_AVAILABLE:
+            boxes_t = _torch.from_numpy(xyxy)
+            scores_t = _torch.from_numpy(conf)
+            keep = _tv_nms(boxes_t, scores_t, NMS_OVERLAP)
+            keep = keep.cpu().numpy()
+            xyxy, conf, cls = xyxy[keep], conf[keep], cls[keep]
         _t.append(time.perf_counter())
 
-        # 纯 IoU 跟踪（完全去掉 ByteTrack，消除卡尔曼滤波 GIL 开销 ~5ms）
-        detections = self._simple_iou_match(detections)
+        # 4. IoU 跟踪（直接操作 numpy，释放 GIL）
+        tracker_ids = self._iou_match_numpy(xyxy)
         _t.append(time.perf_counter())
 
-        # 直接用 detections 作为 filtered（去掉 actual_tids 过滤，减少 ~1ms Python 循环）
-        filtered = detections
-
+        # 5. 构造 detection_list + 速度/zone 逻辑
         detection_list: list[dict] = []
         speed_map: dict[int, float] = {}
 
-        if len(filtered) > 0:
-            for i in range(len(filtered)):
-                tid = int(filtered.tracker_id[i])
-                cid = int(filtered.class_id[i]) if filtered.class_id is not None else -1
-                cls_name = self.class_names.get(cid, "?")
-                conf = float(filtered.confidence[i]) if filtered.confidence is not None else 0.0
-                xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
-                detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
+        for i in range(len(xyxy)):
+            tid = int(tracker_ids[i]) if i < len(tracker_ids) else -1
+            cid = int(cls[i])
+            cls_name = self.class_names.get(cid, "?")
+            c = float(conf[i])
+            b = xyxy[i].tolist()
+            detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": c, "bbox": b})
 
-                if tid == -1:
-                    speed_map[tid] = 0.0
-                    continue
+            if tid == -1:
+                speed_map[tid] = 0.0
+                continue
 
-                cx = (xyxy[0] + xyxy[2]) / 2
-                cy = (xyxy[1] + xyxy[3]) / 2
+            cx = (b[0] + b[2]) / 2
+            cy = (b[1] + b[3]) / 2
 
-                self.trails.setdefault(tid, []).append((cx, cy))
-                if len(self.trails[tid]) > 15:
-                    self.trails[tid].pop(0)
-                self.trail_age[tid] = self.frame_count
+            self.trails.setdefault(tid, []).append((cx, cy))
+            if len(self.trails[tid]) > 15:
+                self.trails[tid].pop(0)
+            self.trail_age[tid] = self.frame_count
 
-                vel_kmh = self._calc_speed(tid, cx, cy, now)
-                speed_map[tid] = vel_kmh
+            vel_kmh = self._calc_speed(tid, cx, cy, now)
+            speed_map[tid] = vel_kmh
 
-                was_in = self._inside_zone.get(tid, False)
-                is_in = self.zx1 < cx < self.zx2 and self.zy1 < cy < self.zy2
-                if not was_in and is_in:
-                    self._entry_events.append((now, tid))
-                elif was_in and not is_in:
-                    self._exit_events.append((now, tid))
-                self._inside_zone[tid] = is_in
+            was_in = self._inside_zone.get(tid, False)
+            is_in = self.zx1 < cx < self.zx2 and self.zy1 < cy < self.zy2
+            if not was_in and is_in:
+                self._entry_events.append((now, tid))
+            elif was_in and not is_in:
+                self._exit_events.append((now, tid))
+            self._inside_zone[tid] = is_in
         _t.append(time.perf_counter())
 
         self._update_store(detection_list, speed_map)
         stats = self._compute_stats(detection_list, speed_map)
         _t.append(time.perf_counter())
 
-        # cv2 直接绘制（释放 GIL）
-        if len(filtered) > 0:
-            for i in range(len(filtered)):
-                tid = int(filtered.tracker_id[i])
-                spd = speed_map.get(tid, 0.0)
-                cid = int(filtered.class_id[i]) if filtered.class_id is not None else -1
-                nm = self.class_names.get(cid, "?")
-                xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
-                x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-                color = _COLORS_BGR[tid % len(_COLORS_BGR)]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                label = f"{nm} {spd:.0f}km/h"
-                cv2.putText(frame, label, (x1, max(y1 - 5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        # 6. cv2 绘制（释放 GIL），简化：只画检测框+标签+COUNT ZONE 矩形（不画文字）
+        for i in range(len(xyxy)):
+            tid = int(tracker_ids[i]) if i < len(tracker_ids) else -1
+            spd = speed_map.get(tid, 0.0)
+            cid = int(cls[i])
+            nm = self.class_names.get(cid, "?")
+            b = xyxy[i]
+            x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            color = _COLORS_BGR[tid % len(_COLORS_BGR)]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{nm} {spd:.0f}", (x1, max(y1 - 5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        self._prune_events(now)
-        cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 2)
-        cv2.putText(frame, "COUNT ZONE", (self.zx1 + 5, self.zy1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        flow = self.get_traffic_flow()
-        for j, txt in enumerate([f"Entry:{flow['entry_count']}", f"Exit:{flow['exit_count']}", f"Flow:{flow['flow_per_min']}/min"]):
-            cv2.putText(frame, txt, (self.zx1 + 5, self.zy2 - 10 - j * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 1)
         _t.append(time.perf_counter())
 
         total_ms = (_t[-1] - _t[0]) * 1000
@@ -177,8 +183,66 @@ class FrameProcessor:
                 (_t[4] - _t[3]) * 1000, (_t[5] - _t[4]) * 1000, total_ms,
             )
 
+        self._prune_events(now)
         self._cleanup_trails()
         return detection_list, frame, stats
+
+    def _iou_match_numpy(self, xyxy: np.ndarray) -> np.ndarray:
+        """纯 numpy IoU 跟踪：不依赖 sv.Detections，全部操作释放 GIL。"""
+        if len(xyxy) == 0:
+            return np.empty(0, dtype=np.int32)
+
+        # 清理旧轨迹
+        if len(self._last_track_boxes) > 50:
+            sorted_ids = sorted(self._last_track_boxes.keys())
+            for tid in sorted_ids[:-50]:
+                del self._last_track_boxes[tid]
+
+        if len(self._last_track_boxes) == 0:
+            N = len(xyxy)
+            tids = np.arange(self._next_track_id, self._next_track_id + N, dtype=np.int32)
+            for i in range(N):
+                self._last_track_boxes[int(tids[i])] = xyxy[i].tolist()
+            self._next_track_id += N
+            return tids
+
+        track_keys = list(self._last_track_boxes.keys())
+        track_ids = np.array(track_keys, dtype=np.int32)
+        track_boxes = np.array([self._last_track_boxes[t] for t in track_keys], dtype=np.float32)
+
+        # 向量化 IoU 矩阵 (N, M) — 全 numpy
+        det = xyxy.astype(np.float32)
+        x1 = np.maximum(det[:, 0:1], track_boxes[:, 0:1].T)
+        y1 = np.maximum(det[:, 1:2], track_boxes[:, 1:2].T)
+        x2 = np.minimum(det[:, 2:3], track_boxes[:, 2:3].T)
+        y2 = np.minimum(det[:, 3:4], track_boxes[:, 3:4].T)
+        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        area_d = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
+        area_t = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
+        iou = inter / (area_d[:, None] + area_t[None, :] - inter + 1e-6)
+
+        # argmax + 降序贪心（仅 N 次 Python 循环）
+        N = len(det)
+        best_j = np.argmax(iou, axis=1)
+        best_iou = iou[np.arange(N), best_j]
+        order = np.argsort(-best_iou)
+
+        result = np.full(N, -1, dtype=np.int32)
+        used = set()
+        for idx in order:
+            j = int(best_j[idx])
+            if best_iou[idx] > 0.3 and j not in used:
+                result[idx] = track_ids[j]
+                used.add(j)
+                self._last_track_boxes[int(track_ids[j])] = det[idx].tolist()
+
+        for i in range(N):
+            if result[i] == -1:
+                result[i] = self._next_track_id
+                self._next_track_id += 1
+                self._last_track_boxes[int(result[i])] = det[i].tolist()
+
+        return result
 
     def _nms(self, detections: sv.Detections) -> sv.Detections:
         # 优先使用 torchvision.ops.nms：C++ 向量化实现，对密集检测帧提速 5-10x。
