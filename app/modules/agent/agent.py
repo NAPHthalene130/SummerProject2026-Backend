@@ -12,8 +12,10 @@ from app.modules.agent.base import BaseAgent
 from app.modules.agent.tool import (
     answer_general_question,
     batch_dispatch_unassigned,
+    batch_ignore_work_orders,
     dispatch_work_order,
     dispatch_work_order_range,
+    dry_run_batch_dispatch,
     get_work_order_detail,
     query_staff,
     query_work_order_stats,
@@ -34,8 +36,10 @@ TOOLS = [
     query_work_order_stats,
     suggest_handling,
     dispatch_work_order,
+    dry_run_batch_dispatch,
     batch_dispatch_unassigned,
     dispatch_work_order_range,
+    batch_ignore_work_orders,
     answer_general_question,
 ]
 
@@ -50,8 +54,10 @@ TOOL_DESCRIPTIONS = {
     "query_work_order_stats": "查询工单统计概况,无必需参数",
     "suggest_handling": "分析工单并生成处置建议,参数: work_order_id(str)",
     "dispatch_work_order": "派发单个工单,参数: work_order_id(str), user_id(int)",
+    "dry_run_batch_dispatch": "批量分配预演(不修改数据库),参数: start_id(可选,int), end_id(可选,int), stage(可选,str), event_level(可选,str), required_category(可选,str)",
     "batch_dispatch_unassigned": "批量派发所有未派发工单,无必需参数",
     "dispatch_work_order_range": "区间派发工单,参数: start_id(int), end_id(int)",
+    "batch_ignore_work_orders": "批量忽略无法处理的工单,参数: start_id(可选,int), end_id(可选,int), stage(可选,str), event_level(可选,str), required_category(可选,str), reason(可选,str)",
     "answer_general_question": "检索交通法规回答通用问题,参数: question(str)",
 }
 
@@ -71,22 +77,26 @@ SYSTEM_PROMPT = """你是智能交通指挥Agent。当用户发出指令时,你�
 
 ## 执行规则 (最高优先级)
 1. 用户说"派发"(单条,如"派发工单335") → 调用 dispatch_work_order。若用户未指定人员,必须先调用 query_staff 获取同类别(work_order_count最小)的人员ID,再调用 dispatch_work_order,严禁编造 user_id;若用户指定了人员名,也先 query_staff 取其 user_id
-2. 用户说"全部派发"/"批量派发"/"批量处理"/"全部尚未派发"(未指定编号范围) → 调用 batch_dispatch_unassigned 一次完成,不要逐个派发
+2. 用户说"全部派发"/"批量派发"/"批量处理"/"全部尚未派发"/"批量分配"/"全部分配"/"自动指派"(未指定编号范围) → 调用 batch_dispatch_unassigned 一次完成,不要逐个派发
 3. 用户说"查询/查看/有哪些" → 调用对应的查询Tool,用1-3句话回复关键信息
 4. 用户说"怎么处理/怎么办" → 调用 suggest_handling,用3-5条操作步骤回复
 5. 用户说"统计/概况" → 调用 query_work_order_stats,用3-4行回复
 6. 用户说"法规/规定/标准" → 调用 answer_general_question;该工具仅返回法规检索依据,需由你据此组织最终中文回答
-7. 批量区间(如"把300~330的工单派发"/"300到330"/"300-330全部派发") → 只需提取起止两个整数,调用 dispatch_work_order_range(300, 330) 一次完成;严禁自行展开成多次 dispatch_work_order,严禁只派发其中一单
+7. 批量区间(如"把300~330的工单派发/分配/指派"/"300到330"/"300-330全部派发") → 只需提取起止两个整数,调用 dispatch_work_order_range(300, 330) 一次完成;严禁自行展开成多次 dispatch_work_order,严禁只派发其中一单
+8. 用户说"无法处理"/"没有可用人员"/"不再处理"/"批量忽略"/"全部忽略" → 调用 batch_ignore_work_orders。若用户给出编号范围,传 start_id/end_id;否则默认只忽略未派发(unassigned)工单。必须保留或概括用户给出的忽略原因
+
+## 预演规则
+用户说"预演"/"模拟"/"看看会怎么分配"/"不要改数据库"/"先检查批量分配"时,调用 dry_run_batch_dispatch;若用户给出编号范围或过滤条件,传 start_id/end_id、event_level、required_category,严禁调用会写库的批量派发工具。
 
 ## 歧义兜底
-若用户指令无法匹配任何工具,用一句话说明你能做什么(查询工单/查询人员/派发/批量派发/区间派发/统计/处置建议/法规问答),不要编造结果或数据。
+若用户指令无法匹配任何工具,用一句话说明你能做什么(查询工单/查询人员/派发/批量派发/区间派发/批量忽略/统计/处置建议/法规问答),不要编造结果或数据。
 
 ## 输出格式
 - 操作类: "已派发工单xxx至[人员名],状态:待处理。"
 - 查询类: "工单xxx,类型[xxx],等级[xxx],状态[xxx],负责人[xxx]。"
 - 建议类: "该工单为[等级]的[类型],当前[状态]。建议:1.xxx 2.xxx 3.xxx"
 - 统计类: "当前共N单,未解决M单(高优K单),人员平均负载X单。"
-- 批量/区间类: 严格遵循工具返回的 presentation_hint,用1行汇总;不要逐条罗列明细,不要输出表格
+- 批量/区间/忽略类: 严格遵循工具返回的 presentation_hint,用1行汇总;不要逐条罗列明细,不要输出表格
 - 严禁输出Markdown表格;严禁出现"结论""依据""未核验项"等结构化小标题;严禁输出内部JSON键名
 
 ## 字段翻译(内部JSON→用户输出)
