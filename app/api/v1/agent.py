@@ -159,8 +159,10 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "query_work_order_stats": "查询工单统计数据,按状态和等级汇总",
     "suggest_handling": "分析工单并基于当前状态生成分阶段处置建议",
     "dispatch_work_order": "将单个工单派发给指定人员",
-    "batch_dispatch_unassigned": "批量派发:自动将所有未派发工单按类别匹配最优人员并派发(不指定编号范围)",
-    "dispatch_work_order_range": "区间派发:派发指定编号区间(如300~330)内的所有未派发工单",
+    "dry_run_batch_dispatch": "批量分配预演:按当前工单和人员数据计算派发计划,不修改数据库",
+    "batch_dispatch_unassigned": "批量派发/批量分配:自动将所有未派发工单按类别匹配最优人员并派发(不指定编号范围)",
+    "dispatch_work_order_range": "区间派发/区间分配:派发指定编号区间(如300~330)内的所有未派发工单",
+    "batch_ignore_work_orders": "批量忽略:将无法处理的未派发/待处理工单按筛选条件批量标记为已忽略",
     "answer_general_question": "回答交通管理法规和处置流程等通用问题",
 }
 

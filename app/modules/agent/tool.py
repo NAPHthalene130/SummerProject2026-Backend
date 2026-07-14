@@ -4,8 +4,6 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from openai import OpenAI
-
 from app.config import llm_settings
 from app.database import mysql_connection
 from app.repository.work_order_repository import (
@@ -16,14 +14,16 @@ from app.repository.work_order_repository import (
 
 logger = logging.getLogger(__name__)
 _rag_manager_instance: Any = None
-_vlm_client: Optional[OpenAI] = None
+_vlm_client: Optional[Any] = None
 
 _IMAGE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "orderImg"
 
 
-def _get_vlm_client() -> OpenAI:
+def _get_vlm_client() -> Any:
     global _vlm_client
     if _vlm_client is None:
+        from openai import OpenAI
+
         _vlm_client = OpenAI(
             base_url=llm_settings.url,
             api_key=llm_settings.api_key,
@@ -462,24 +462,102 @@ _BATCH_PRESENTATION_HINT = (
     )
 
 
-def _dispatch_unassigned_orders(
-    orders: list[Any], staff_list: list[Any]
-) -> dict[str, Any]:
-    """对给定的未派发工单逐个匹配同类别负载最低人员并派发,返回汇总结果。
+def _split_batch_details(details: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    items = [item for item in details if item.get("result") in {"success", "planned", "ignored"}]
+    skipped_items = [item for item in details if item.get("result") == "skipped"]
+    failed_items = [item for item in details if item.get("result") == "failed"]
+    return items, skipped_items, failed_items
 
-    workload_override 在批次内累加,避免所有工单都压到同一人(修正单次快照不刷新的负载均衡问题)。
-    """
-    results: list[dict[str, Any]] = []
-    success_count = 0
-    skip_count = 0
-    fail_count = 0
+
+def _fallback_candidates_from(skipped_items: list[dict[str, Any]], failed_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in skipped_items + failed_items:
+        work_order_id = item.get("work_order_id")
+        if not work_order_id:
+            continue
+        candidates.append({
+            "work_order_id": work_order_id,
+            "type": item.get("type"),
+            "level": item.get("level"),
+            "required_category": item.get("required_category"),
+            "reason": item.get("reason", "无法处理"),
+        })
+    return candidates
+
+
+def _structured_batch_payload(
+    *,
+    tool_name: str,
+    mode: str,
+    action: str,
+    total: int,
+    success: int = 0,
+    skipped: int = 0,
+    failed: int = 0,
+    details: list[dict[str, Any]],
+    presentation_hint: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    items, skipped_items, failed_items = _split_batch_details(details)
+    fallback_candidates = _fallback_candidates_from(skipped_items, failed_items)
+    summary = {
+        "total": total,
+        "success": success,
+        "skipped": skipped,
+        "failed": failed,
+    }
+    payload: dict[str, Any] = {
+        "ok": failed == 0,
+        "tool": tool_name,
+        "mode": mode,
+        "action": action,
+        "summary": summary,
+        "affected_work_order_ids": [item["work_order_id"] for item in items if item.get("result") in {"success", "ignored"}],
+        "items": items,
+        "skipped_items": skipped_items,
+        "failed_items": failed_items,
+        "fallback_candidates": fallback_candidates,
+        "next_actions": [
+            {
+                "tool": "batch_ignore_work_orders",
+                "reason": "存在无法自动分配的工单",
+                "candidate_count": len(fallback_candidates),
+            }
+        ] if fallback_candidates else [],
+        "needs_manual_fallback": bool(fallback_candidates),
+        "fallback_hint": (
+            "若用户确认这些跳过/失败工单无需继续处理,可调用 batch_ignore_work_orders "
+            "按 fallback_candidates 或筛选条件批量忽略。"
+            if fallback_candidates
+            else ""
+        ),
+        "presentation_hint": presentation_hint,
+        # Backward compatible fields for existing callers/tests.
+        "total": total,
+        "success": success,
+        "skipped": skipped,
+        "failed": failed,
+        "details": details,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _plan_unassigned_orders(
+    orders: list[Any],
+    staff_list: list[Any],
+) -> dict[str, Any]:
+    details: list[dict[str, Any]] = []
     workload_override: dict[int, int] = {}
+    planned_count = 0
+    skip_count = 0
 
     for wo in orders:
         category = wo.required_category or "traffic_police"
         best = _select_best_staff(staff_list, category, workload_override)
         if best is None:
-            results.append({
+            details.append({
                 "work_order_id": wo.work_order_id,
                 "type": wo.accident_info,
                 "level": wo.event_level,
@@ -490,16 +568,61 @@ def _dispatch_unassigned_orders(
             skip_count += 1
             continue
 
+        details.append({
+            "work_order_id": wo.work_order_id,
+            "type": wo.accident_info,
+            "level": wo.event_level,
+            "required_category": category,
+            "assigned_to": best.name,
+            "staff_id": int(best.id),
+            "result": "planned",
+        })
+        planned_count += 1
+        workload_override[int(best.id)] = workload_override.get(int(best.id), 0) + 1
+
+    return {
+        "total": len(orders),
+        "planned": planned_count,
+        "skipped": skip_count,
+        "details": details,
+    }
+
+
+def _dispatch_unassigned_orders(
+    orders: list[Any],
+    staff_list: list[Any],
+    *,
+    tool_name: str = "batch_dispatch_unassigned",
+    action: str = "batch_dispatch",
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """对给定的未派发工单逐个匹配同类别负载最低人员并派发,返回汇总结果。
+
+    workload_override 在批次内累加,避免所有工单都压到同一人(修正单次快照不刷新的负载均衡问题)。
+    """
+    plan = _plan_unassigned_orders(orders, staff_list)
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    fail_count = 0
+
+    order_by_id = {str(wo.work_order_id): wo for wo in orders}
+    for planned in plan["details"]:
+        if planned.get("result") == "skipped":
+            results.append(planned)
+            continue
+        if planned.get("result") != "planned":
+            continue
+        wo = order_by_id[str(planned["work_order_id"])]
         try:
             dispatch_result = WorkOrderRepository.dispatch_work_order(
-                str(wo.work_order_id), int(best.id)
+                str(wo.work_order_id), int(planned["staff_id"])
             )
         except ValueError as exc:
             results.append({
                 "work_order_id": wo.work_order_id,
                 "type": wo.accident_info,
                 "level": wo.event_level,
-                "required_category": category,
+                "required_category": planned.get("required_category"),
                 "result": "failed",
                 "reason": str(exc),
             })
@@ -509,6 +632,9 @@ def _dispatch_unassigned_orders(
             logger.exception("batch dispatch 派发异常 work_order=%s", wo.work_order_id)
             results.append({
                 "work_order_id": wo.work_order_id,
+                "type": wo.accident_info,
+                "level": wo.event_level,
+                "required_category": planned.get("required_category"),
                 "result": "failed",
                 "reason": str(exc),
             })
@@ -518,6 +644,9 @@ def _dispatch_unassigned_orders(
         if dispatch_result is None:
             results.append({
                 "work_order_id": wo.work_order_id,
+                "type": wo.accident_info,
+                "level": wo.event_level,
+                "required_category": planned.get("required_category"),
                 "result": "failed",
                 "reason": "派发返回空结果",
             })
@@ -528,26 +657,117 @@ def _dispatch_unassigned_orders(
                 "type": dispatch_result.accident_info,
                 "level": dispatch_result.event_level,
                 "assigned_to": dispatch_result.assignee,
-                "staff_id": int(best.id),
+                "staff_id": int(planned["staff_id"]),
                 "result": "success",
             })
             success_count += 1
-            workload_override[int(best.id)] = workload_override.get(int(best.id), 0) + 1
 
-    return {
-        "total": len(orders),
-        "success": success_count,
-        "skipped": skip_count,
-        "failed": fail_count,
-        "details": results,
-        "presentation_hint": _BATCH_PRESENTATION_HINT,
-    }
+    return _structured_batch_payload(
+        tool_name=tool_name,
+        mode="write",
+        action=action,
+        total=len(orders),
+        success=success_count,
+        skipped=plan["skipped"],
+        failed=fail_count,
+        details=results,
+        presentation_hint=_BATCH_PRESENTATION_HINT,
+        extra=extra,
+    )
+
+
+def dry_run_batch_dispatch(
+    start_id: Optional[int] = None,
+    end_id: Optional[int] = None,
+    stage: str = "unassigned",
+    event_level: Optional[str] = None,
+    required_category: Optional[str] = None,
+) -> str:
+    """批量分配预演:只计算哪些工单会被分配给哪些人员,不修改数据库。
+    start_id/end_id: 可选编号区间,必须同时提供。
+    stage: 默认预演未派发(unassigned)工单。
+    event_level: 可选等级过滤(low/medium/high)。
+    required_category: 可选人员类别过滤。
+    适用于正式批量派发前的预检查和风险评估。"""
+    allowed_stages = {"unassigned", "pending", "processing"}
+    if stage not in allowed_stages:
+        return json.dumps({
+            "ok": False,
+            "tool": "dry_run_batch_dispatch",
+            "mode": "dry_run",
+            "error": f"不支持预演阶段 '{stage}'",
+            "total": 0,
+            "success": 0,
+        }, ensure_ascii=False)
+
+    lo: Optional[int] = None
+    hi: Optional[int] = None
+    if start_id is not None or end_id is not None:
+        if start_id is None or end_id is None:
+            return json.dumps({
+                "ok": False,
+                "tool": "dry_run_batch_dispatch",
+                "mode": "dry_run",
+                "error": "编号区间必须同时提供 start_id 和 end_id",
+                "total": 0,
+                "success": 0,
+            }, ensure_ascii=False)
+        lo, hi = sorted((int(start_id), int(end_id)))
+
+    try:
+        all_orders = WorkOrderRepository.list_work_orders()
+        staff_list = WorkOrderRepository.list_staff()
+    except Exception as exc:
+        logger.exception("dry_run_batch_dispatch 查询失败")
+        return json.dumps({"error": f"批量分配预演失败: {exc}", "data": None}, ensure_ascii=False)
+
+    selected: list[Any] = []
+    for wo in all_orders:
+        try:
+            numeric_id = parse_work_order_id(wo.work_order_id)
+        except (TypeError, ValueError):
+            continue
+        if lo is not None and hi is not None and not (lo <= numeric_id <= hi):
+            continue
+        if wo.status != stage:
+            continue
+        if not _matches_optional_filter(wo.event_level, event_level):
+            continue
+        if not _matches_optional_filter(getattr(wo, "required_category", None), required_category):
+            continue
+        selected.append(wo)
+
+    plan = _plan_unassigned_orders(selected, staff_list)
+    payload = _structured_batch_payload(
+        tool_name="dry_run_batch_dispatch",
+        mode="dry_run",
+        action="dry_run_batch_dispatch",
+        total=plan["total"],
+        success=plan["planned"],
+        skipped=plan["skipped"],
+        failed=0,
+        details=plan["details"],
+        presentation_hint=(
+            "请用1句话说明预演结果,例如:'预演发现可分配250单,无法自动分配200单。'"
+            "不要声称已执行数据库修改。"
+        ),
+        extra={
+            "range": [lo, hi] if lo is not None and hi is not None else None,
+            "filters": {
+                "stage": stage,
+                "event_level": event_level,
+                "required_category": required_category,
+            },
+            "would_modify_database": False,
+        },
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def batch_dispatch_unassigned() -> str:
-    """批量派发:将所有未派发(unassigned)工单自动匹配同类别负载最低的人员并派发。
+    """批量派发/批量分配:将所有未派发(unassigned)工单自动匹配同类别负载最低的人员并派发。
     无需参数,自动完成查询→匹配→派发全流程,返回每条工单的派发结果摘要。
-    适用于"批量处理/全部派发/批量派发"等不指定编号范围的批量指令——调用一次即可,不要逐个派发。"""
+    适用于"批量处理/全部派发/批量派发/批量分配/全部分配/自动指派"等不指定编号范围的批量指令——调用一次即可,不要逐个派发。"""
     try:
         all_orders = WorkOrderRepository.list_work_orders()
         staff_list = WorkOrderRepository.list_staff()
@@ -566,11 +786,11 @@ def batch_dispatch_unassigned() -> str:
 
 
 def dispatch_work_order_range(start_id: int, end_id: int) -> str:
-    """批量派发指定编号区间内的所有未派发工单(自动按类别匹配负载最低人员)。
+    """批量派发/批量分配指定编号区间内的所有未派发工单(自动按类别匹配负载最低人员)。
     start_id: 起始工单编号(含),如 300
     end_id: 结束工单编号(含),如 330
     一次性派发区间内所有 unassigned 工单;非 unassigned 状态自动跳过。
-    适用于"把300~330的工单派发"这类指定编号区间的批量指令——调用一次即可,不要逐个展开派发。"""
+    适用于"把300~330的工单派发/分配/指派"这类指定编号区间的批量指令——调用一次即可,不要逐个展开派发。"""
     lo, hi = sorted((int(start_id), int(end_id)))
     try:
         all_orders = WorkOrderRepository.list_work_orders()
@@ -602,9 +822,157 @@ def dispatch_work_order_range(start_id: int, end_id: int) -> str:
             "total": len(in_range),
         }, ensure_ascii=False)
 
-    summary = _dispatch_unassigned_orders(in_range, staff_list)
-    summary["range"] = [lo, hi]
+    summary = _dispatch_unassigned_orders(
+        in_range,
+        staff_list,
+        tool_name="dispatch_work_order_range",
+        action="dispatch_work_order_range",
+        extra={"range": [lo, hi]},
+    )
     return json.dumps(summary, ensure_ascii=False)
+
+
+def _matches_optional_filter(value: Any, expected: Optional[str]) -> bool:
+    return expected is None or value == expected
+
+
+def batch_ignore_work_orders(
+    start_id: Optional[int] = None,
+    end_id: Optional[int] = None,
+    stage: str = "unassigned",
+    event_level: Optional[str] = None,
+    required_category: Optional[str] = None,
+    reason: str = "无法处理,批量忽略。",
+) -> str:
+    """批量忽略无法处理的工单。
+    start_id: 可选,起始工单编号(含),如300;与end_id同时提供时仅处理该编号区间。
+    end_id: 可选,结束工单编号(含),如330;与start_id同时提供时仅处理该编号区间。
+    stage: 要忽略的工单阶段,默认只忽略未派发(unassigned);可传pending/processing处理极端无法继续处理的情况。
+    event_level: 可选,仅忽略指定等级(low/medium/high)。
+    required_category: 可选,仅忽略指定人员类别无法处理的工单。
+    reason: 忽略原因,会写入处理记录。
+    适用于"无法处理/没有可用人员/不再处理/批量忽略/全部忽略"等兜底指令。"""
+    allowed_stages = {"unassigned", "pending", "processing"}
+    if stage not in allowed_stages:
+        return json.dumps(
+            {
+                "error": f"不允许批量忽略阶段 '{stage}',仅支持 {sorted(allowed_stages)}",
+                "total": 0,
+                "ignored": 0,
+            },
+            ensure_ascii=False,
+        )
+
+    lo: Optional[int] = None
+    hi: Optional[int] = None
+    if start_id is not None or end_id is not None:
+        if start_id is None or end_id is None:
+            return json.dumps(
+                {
+                    "error": "编号区间必须同时提供 start_id 和 end_id",
+                    "total": 0,
+                    "ignored": 0,
+                },
+                ensure_ascii=False,
+            )
+        lo, hi = sorted((int(start_id), int(end_id)))
+
+    try:
+        all_orders = WorkOrderRepository.list_work_orders()
+    except Exception as exc:
+        logger.exception("batch_ignore_work_orders 查询失败")
+        return json.dumps({"error": f"批量忽略查询失败: {exc}", "data": None}, ensure_ascii=False)
+
+    candidates: list[Any] = []
+    skipped: list[dict[str, Any]] = []
+    for wo in all_orders:
+        try:
+            numeric_id = parse_work_order_id(wo.work_order_id)
+        except (TypeError, ValueError):
+            skipped.append({
+                "work_order_id": getattr(wo, "work_order_id", ""),
+                "result": "skipped",
+                "reason": "工单编号无法解析",
+            })
+            continue
+
+        in_range = lo is None or hi is None or lo <= numeric_id <= hi
+        if not in_range:
+            continue
+        if not _matches_optional_filter(wo.status, stage):
+            continue
+        if not _matches_optional_filter(wo.event_level, event_level):
+            continue
+        if not _matches_optional_filter(getattr(wo, "required_category", None), required_category):
+            continue
+        candidates.append(wo)
+
+    results: list[dict[str, Any]] = []
+    ignored_count = 0
+    failed_count = 0
+    normalized_reason = reason.strip() or "无法处理,批量忽略。"
+
+    for wo in candidates:
+        previous_stage = wo.status
+        try:
+            updated = WorkOrderRepository.update_work_order_status(
+                str(wo.work_order_id),
+                "ignored",
+                process_message=normalized_reason,
+            )
+        except Exception as exc:
+            logger.exception("batch_ignore_work_orders 忽略异常 work_order=%s", wo.work_order_id)
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "result": "failed",
+                "reason": str(exc),
+            })
+            failed_count += 1
+            continue
+
+        if updated is None:
+            results.append({
+                "work_order_id": wo.work_order_id,
+                "result": "failed",
+                "reason": "更新返回空结果",
+            })
+            failed_count += 1
+            continue
+
+        results.append({
+            "work_order_id": updated.work_order_id,
+            "type": updated.accident_info,
+            "level": updated.event_level,
+            "previous_stage": previous_stage,
+            "result": "ignored",
+            "reason": normalized_reason,
+        })
+        ignored_count += 1
+
+    payload = _structured_batch_payload(
+        tool_name="batch_ignore_work_orders",
+        mode="write",
+        action="batch_ignore",
+        total=len(candidates),
+        success=ignored_count,
+        skipped=len(skipped),
+        failed=failed_count,
+        details=results + skipped,
+        presentation_hint=(
+            "请用1句话回复,例如:'已将无法处理的未派发工单批量忽略,共忽略N单,失败M单。'"
+            "禁止输出Markdown表格。"
+        ),
+        extra={
+            "range": [lo, hi] if lo is not None and hi is not None else None,
+            "filters": {
+                "stage": stage,
+                "event_level": event_level,
+                "required_category": required_category,
+            },
+            "ignored": ignored_count,
+        },
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def answer_general_question(question: str) -> str:
@@ -639,7 +1007,9 @@ TOOLS = [
     query_work_order_stats,
     suggest_handling,
     dispatch_work_order,
+    dry_run_batch_dispatch,
     batch_dispatch_unassigned,
     dispatch_work_order_range,
+    batch_ignore_work_orders,
     answer_general_question,
 ]
