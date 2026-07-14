@@ -6,11 +6,12 @@ CONSECUTIVE_NORMAL_THRESHOLD = 10
 
 
 class BoundingBoxItem:
-    def __init__(self, track_id: int, class_name: str, confidence: float, bbox: list[float]):
+    def __init__(self, track_id: int, class_name: str, confidence: float, bbox: list[float], speed: float = 0.0):
         self.track_id = track_id
         self.class_name = class_name
         self.confidence = confidence
         self.bbox = bbox
+        self.speed = speed  # 单辆车的速度（km/h），供前端 canvas 显示
 
 
 class CameraData:

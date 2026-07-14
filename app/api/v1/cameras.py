@@ -61,7 +61,7 @@ async def stream_all_boxes():
             payload = {}
             for cam_id, data in store.get_all().items():
                 payload[cam_id] = [
-                    {"track_id": b.track_id, "class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox}
+                    {"track_id": b.track_id, "class_name": b.class_name, "confidence": b.confidence, "bbox": b.bbox, "speed": b.speed}
                     for b in data.boxes
                 ]
             try:

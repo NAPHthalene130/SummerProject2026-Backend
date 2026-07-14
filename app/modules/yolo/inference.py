@@ -395,7 +395,8 @@ class FrameProcessor:
             camera_id=self.cam_id,
             total_vehicle_count=len(detection_list),
             boxes=[BoundingBoxItem(track_id=int(d["track_id"]), class_name=str(d["class_name"]),
-                                   confidence=float(d["confidence"]), bbox=list(d["bbox"])) for d in detection_list],
+                                   confidence=float(d["confidence"]), bbox=list(d["bbox"]),
+                                   speed=float(speed_map.get(d["track_id"], 0.0))) for d in detection_list],
             lane_count=lane_count, avg_speed=avg_s, max_speed=max_s,
             car_count=cc, truck_count=tc, bus_count=bc, moto_count=mc,
         )
