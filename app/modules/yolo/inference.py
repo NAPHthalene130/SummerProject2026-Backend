@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections import Counter
 
 import cv2
 import numpy as np
@@ -50,6 +51,7 @@ class FrameProcessor:
         self._speed_last_update: dict[int, float] = {}
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
+        self._lane_history: list[int] = []  # 滑动窗口平滑车道数（30帧≈2s 取众数）
         self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=30)
         # 标注器在 __init__ 中创建一次复用，避免每帧 new 带来的 450 次/s 对象创建与 GC 压力
         self._box_annotator = sv.BoxAnnotator(color=COLOR_PALETTE, thickness=2)
@@ -262,7 +264,10 @@ class FrameProcessor:
 
     def _update_store(self, detection_list: list[dict], speed_map: dict[int, float]):
         cx_list = [((d["bbox"][0] + d["bbox"][2]) / 2) for d in detection_list]
-        lane_count = self._estimate_lanes(cx_list)
+        # 优先读取 LaneSegmentationWorker 缓存的车道数（精确分割模型结果）；
+        # 为 None 时回退到滑动窗口平滑启发式（方案 A），消除每帧抖动。
+        cached_lane_count = CameraDataStore().get_lane_count(self.cam_id)
+        lane_count = cached_lane_count if cached_lane_count is not None else self._estimate_lanes_stable(cx_list)
         speeds = [speed_map.get(d["track_id"], 0.0) for d in detection_list]
         avg_s = float(np.mean(speeds)) if speeds else 0.0
         max_s = float(np.max(speeds)) if speeds else 0.0
@@ -293,6 +298,14 @@ class FrameProcessor:
                     clusters += 1
             return max(1, min(clusters, 8))
         return max(1, len(cx_list))
+
+    def _estimate_lanes_stable(self, cx_list: list[float]) -> int:
+        """滑动窗口平滑（30帧≈2s）取众数，消除每帧车道数抖动。"""
+        raw = self._estimate_lanes(cx_list)
+        self._lane_history.append(raw)
+        if len(self._lane_history) > 30:
+            self._lane_history.pop(0)
+        return Counter(self._lane_history).most_common(1)[0][0]
 
     def _compute_stats(self, dlist: list[dict], smap: dict[int, float]) -> dict:
         speeds = [smap.get(d["track_id"], 0.0) for d in dlist]
