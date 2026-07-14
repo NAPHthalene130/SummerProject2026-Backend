@@ -159,19 +159,8 @@ class FrameProcessor:
         stats = self._compute_stats(detection_list, speed_map)
         _t.append(time.perf_counter())
 
-        # 6. cv2 绘制（释放 GIL），简化：只画检测框+标签+COUNT ZONE 矩形（不画文字）
-        for i in range(len(xyxy)):
-            tid = int(tracker_ids[i]) if i < len(tracker_ids) else -1
-            spd = speed_map.get(tid, 0.0)
-            cid = int(cls[i])
-            nm = self.class_names.get(cid, "?")
-            b = xyxy[i]
-            x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
-            color = _COLORS_BGR[tid % len(_COLORS_BGR)]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"{nm} {spd:.0f}", (x1, max(y1 - 5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-
-        cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 1)
+        # 不在后端画框 — 检测框通过 SSE 推送给前端 canvas 异步绘制
+        # 后端只返回原始帧（未修改），WebRTC 推送原始帧，视频更流畅
         _t.append(time.perf_counter())
 
         total_ms = (_t[-1] - _t[0]) * 1000
