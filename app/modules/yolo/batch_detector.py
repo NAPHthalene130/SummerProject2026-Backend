@@ -111,6 +111,7 @@ class BatchDetector:
 
         self._fps = 0.0
         self._window_total = 0
+        self._window_batches = 0
         self._lifetime_total = 0
         self._last_fps = time.perf_counter()
         self._metrics_lock = threading.Lock()
@@ -268,6 +269,8 @@ class BatchDetector:
         return selected
 
     def _process_batch(self, items: list[tuple[str, PendingFrame]]) -> None:
+        with self._metrics_lock:
+            self._window_batches += 1
         frames = [pending.frame for _, pending in items]
         try:
             results = list(
@@ -317,7 +320,11 @@ class BatchDetector:
     def _postprocess_job(self, cam_id: str, pending: PendingFrame, result) -> None:
         processed = False
         try:
+            t0 = time.perf_counter()
             self._process_single(cam_id, pending, result)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if elapsed_ms > 20:
+                logger.warning("process_single cam=%s took %.1fms (slow)", cam_id, elapsed_ms)
             processed = True
         except Exception:
             logger.exception("YOLO post-process failed for camera %s", cam_id)
@@ -348,14 +355,18 @@ class BatchDetector:
             elapsed = now - self._last_fps
             if elapsed >= 5.0:
                 self._fps = self._window_total / elapsed
+                avg_batch = self._window_total / max(1, self._window_batches)
                 self._window_total = 0
+                self._window_batches = 0
                 self._last_fps = now
                 with self._streams_lock:
                     stream_count = len(self._streams)
+                with self._pending_lock:
+                    inflight = len(self._post_inflight)
+                    pending = len(self._pending)
                 logger.info(
-                    "BatchDetector FPS: %.1f (%d cams)",
-                    self._fps,
-                    stream_count,
+                    "BatchDetector FPS: %.1f (%d cams, avg_batch=%.1f, inflight=%d, pending=%d)",
+                    self._fps, stream_count, avg_batch, inflight, pending,
                 )
 
     def performance_snapshot(self) -> dict:
