@@ -32,6 +32,11 @@ PIXEL_TO_METER = 0.05
 # 新 track 冷启动初始速度（km/h）。城市道路常见速度，避免新车前几帧显示0。
 # 停着的车后续帧位移~0会被下限保护(<2归零)自然回落到0。
 COLD_START_KMH = 25.0
+# 速度保底区间（km/h）：动着的车保底值在 [SPEED_FLOOR_MIN, SPEED_FLOOR_MAX] 之间，
+# 每个 track 基于其 id 生成一个固定伪随机值，避免所有车显示同一速度。
+# 算出值高于该 track 的保底值时自动取真实值（不封顶）。
+SPEED_FLOOR_MIN = 20.0
+SPEED_FLOOR_MAX = 27.0
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
 
@@ -62,6 +67,8 @@ class FrameProcessor:
         self._trajectories: dict[int, list] = {}
         self._speed_last_update: dict[int, float] = {}
         self._speed_stable: dict[int, float] = {}
+        # 每 track 的保底速度缓存（20-27 伪随机，基于 track_id 稳定生成）
+        self._floor_kmh_cache: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []
         # 纯 IoU 跟踪 — 用 numpy 数组存储轨迹（替代 dict，避免 Python 循环和列表推导式 GIL 开销）
@@ -75,6 +82,16 @@ class FrameProcessor:
         self.zy1 = int(h * margin)
         self.zx2 = w - self.zx1
         self.zy2 = h - self.zy1
+
+    def _get_floor_kmh(self, track_id: int) -> float:
+        """返回该 track 的保底速度（20-27 之间，基于 track_id 稳定伪随机）。
+        首次调用时生成并缓存，后续直接读缓存。算出值高于此值时取真实值，不封顶。"""
+        if track_id not in self._floor_kmh_cache:
+            # 线性同余生成器：track_id → [0,1) → 映射到 [SPEED_FLOOR_MIN, SPEED_FLOOR_MAX)
+            seed = (track_id * 9301 + 49297) % 233280
+            ratio = seed / 233280.0
+            self._floor_kmh_cache[track_id] = SPEED_FLOOR_MIN + ratio * (SPEED_FLOOR_MAX - SPEED_FLOOR_MIN)
+        return self._floor_kmh_cache[track_id]
 
     def _get_color(self, track_id: int) -> sv.Color:
         if track_id not in self._track_colors:
@@ -394,11 +411,13 @@ class FrameProcessor:
         is_static = new_kmh < 2.0
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
-        # 下限保护（业务规则）：静止归零，动着的保底 20
+        # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
         if is_static:
             new_kmh = 0.0
-        elif new_kmh < 20.0:
-            new_kmh = 20.0
+        else:
+            floor = self._get_floor_kmh(track_id)
+            if new_kmh < floor:
+                new_kmh = floor
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
@@ -440,11 +459,13 @@ class FrameProcessor:
         is_static = new_kmh < 2.0
         if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
-        # 下限保护（业务规则）：静止归零，动着的保底 20
+        # 下限保护：静止归零；动着的取该track保底值(20-27伪随机)，高于保底值保持真实
         if is_static:
             new_kmh = 0.0
-        elif new_kmh < 20.0:
-            new_kmh = 20.0
+        else:
+            floor = self._get_floor_kmh(track_id)
+            if new_kmh < floor:
+                new_kmh = floor
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
