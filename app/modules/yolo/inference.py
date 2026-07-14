@@ -57,8 +57,9 @@ class FrameProcessor:
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []
-        # 纯 IoU 跟踪（完全去掉 ByteTrack，消除卡尔曼滤波 GIL 开销）
-        self._last_track_boxes: dict[int, list[float]] = {}  # track_id → bbox
+        # 纯 IoU 跟踪 — 用 numpy 数组存储轨迹（替代 dict，避免 Python 循环和列表推导式 GIL 开销）
+        self._track_ids: np.ndarray = np.empty(0, dtype=np.int32)    # (M,) track IDs
+        self._track_boxes: np.ndarray = np.empty((0, 4), dtype=np.float32)  # (M, 4) bboxes
         self._next_track_id: int = 1
 
     def init_zone(self, h: int, w: int, margin: float = 0.15):
@@ -179,59 +180,67 @@ class FrameProcessor:
         return detection_list, frame, stats
 
     def _iou_match_numpy(self, xyxy: np.ndarray) -> np.ndarray:
-        """纯 numpy IoU 跟踪：不依赖 sv.Detections，全部操作释放 GIL。"""
-        if len(xyxy) == 0:
+        """纯 numpy IoU 跟踪：全数组操作，无 dict/list 推导式，最大化释放 GIL。"""
+        N = len(xyxy)
+        if N == 0:
             return np.empty(0, dtype=np.int32)
 
-        # 清理旧轨迹
-        if len(self._last_track_boxes) > 50:
-            sorted_ids = sorted(self._last_track_boxes.keys())
-            for tid in sorted_ids[:-50]:
-                del self._last_track_boxes[tid]
+        det = xyxy.astype(np.float32)
+        M = len(self._track_ids)
 
-        if len(self._last_track_boxes) == 0:
-            N = len(xyxy)
+        # 无历史轨迹（第一帧）
+        if M == 0:
             tids = np.arange(self._next_track_id, self._next_track_id + N, dtype=np.int32)
-            for i in range(N):
-                self._last_track_boxes[int(tids[i])] = xyxy[i].tolist()
+            self._track_ids = tids.copy()
+            self._track_boxes = det.copy()
             self._next_track_id += N
             return tids
 
-        track_keys = list(self._last_track_boxes.keys())
-        track_ids = np.array(track_keys, dtype=np.int32)
-        track_boxes = np.array([self._last_track_boxes[t] for t in track_keys], dtype=np.float32)
-
-        # 向量化 IoU 矩阵 (N, M) — 全 numpy
-        det = xyxy.astype(np.float32)
-        x1 = np.maximum(det[:, 0:1], track_boxes[:, 0:1].T)
-        y1 = np.maximum(det[:, 1:2], track_boxes[:, 1:2].T)
-        x2 = np.minimum(det[:, 2:3], track_boxes[:, 2:3].T)
-        y2 = np.minimum(det[:, 3:4], track_boxes[:, 3:4].T)
+        # IoU 矩阵 (N, M) — 全 numpy 释放 GIL
+        trk = self._track_boxes  # 已是 numpy 数组，无需构造
+        x1 = np.maximum(det[:, 0:1], trk[:, 0:1].T)
+        y1 = np.maximum(det[:, 1:2], trk[:, 1:2].T)
+        x2 = np.minimum(det[:, 2:3], trk[:, 2:3].T)
+        y2 = np.minimum(det[:, 3:4], trk[:, 3:4].T)
         inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
         area_d = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
-        area_t = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
+        area_t = (trk[:, 2] - trk[:, 0]) * (trk[:, 3] - trk[:, 1])
         iou = inter / (area_d[:, None] + area_t[None, :] - inter + 1e-6)
 
-        # argmax + 降序贪心（仅 N 次 Python 循环）
-        N = len(det)
+        # argmax + 降序贪心（N 次 Python 循环，N 通常 <30）
         best_j = np.argmax(iou, axis=1)
         best_iou = iou[np.arange(N), best_j]
         order = np.argsort(-best_iou)
 
         result = np.full(N, -1, dtype=np.int32)
-        used = set()
+        used = np.zeros(M, dtype=bool)  # numpy 布尔数组代替 set
         for idx in order:
             j = int(best_j[idx])
-            if best_iou[idx] > 0.3 and j not in used:
-                result[idx] = track_ids[j]
-                used.add(j)
-                self._last_track_boxes[int(track_ids[j])] = det[idx].tolist()
+            if best_iou[idx] > 0.3 and not used[j]:
+                result[idx] = self._track_ids[j]
+                used[j] = True
 
-        for i in range(N):
-            if result[i] == -1:
-                result[i] = self._next_track_id
-                self._next_track_id += 1
-                self._last_track_boxes[int(result[i])] = det[i].tolist()
+        # 批量更新匹配的轨迹（numpy 向量化，无 Python 循环）
+        matched_mask = result != -1
+        if np.any(matched_mask):
+            matched_det_idx = np.where(matched_mask)[0]
+            matched_trk_idx = best_j[matched_det_idx]
+            self._track_boxes[matched_trk_idx] = det[matched_det_idx]
+
+        # 未匹配的分配新 ID + 追加到轨迹数组（numpy concatenate，无 Python 循环）
+        unmatched_mask = ~matched_mask
+        unmatched_count = int(np.sum(unmatched_mask))
+        if unmatched_count > 0:
+            new_ids = np.arange(self._next_track_id, self._next_track_id + unmatched_count, dtype=np.int32)
+            result[unmatched_mask] = new_ids
+            self._next_track_id += unmatched_count
+            self._track_ids = np.concatenate([self._track_ids, new_ids])
+            self._track_boxes = np.concatenate([self._track_boxes, det[unmatched_mask]])
+
+        # 清理旧轨迹（超过 80 个时只保留最近 50 个）
+        if len(self._track_ids) > 80:
+            self._track_ids = self._track_ids[-50:].copy()
+            self._track_boxes = self._track_boxes[-50:].copy()
 
         return result
 
