@@ -206,18 +206,29 @@ class BatchDetector:
         )
 
     def _loop(self):
+        # 凑到 BATCH_SIZE 的一半就立即推理，避免小批量推理的 GPU 固定开销占比过大。
+        # BATCH_COLLECT_SECONDS 作为最大等待上限（66ms ≈ 一帧间隔），防止帧稀疏时无限等待。
+        min_batch = max(1, BATCH_SIZE // 2)
         while self._running:
             self._pending_event.wait(timeout=0.05)
             if not self._running:
                 break
 
-            # Give concurrently arriving cameras a very small window to form a
-            # fuller GPU batch without adding visible end-to-end latency.
-            if (
-                BATCH_COLLECT_SECONDS
-                and self._eligible_pending_count() < BATCH_SIZE
-                and self._stop_event.wait(BATCH_COLLECT_SECONDS)
-            ):
+            # 凑批策略：等到 eligible 帧数 >= min_batch 或超时 BATCH_COLLECT_SECONDS。
+            # 帧数足够时立即推理不浪费时间；帧数不足时最多等 BATCH_COLLECT_SECONDS。
+            # 每 5ms 轮询一次帧数，在新帧到达后尽快响应。
+            if BATCH_COLLECT_SECONDS and self._eligible_pending_count() < min_batch:
+                deadline = time.perf_counter() + BATCH_COLLECT_SECONDS
+                while True:
+                    if self._eligible_pending_count() >= min_batch:
+                        break
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    if self._stop_event.wait(min(remaining, 0.005)):
+                        break
+
+            if not self._running:
                 break
 
             items = self._take_batch()
