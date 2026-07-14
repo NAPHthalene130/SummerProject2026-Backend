@@ -231,9 +231,12 @@ class FrameProcessor:
             was_in = self._inside_zone.get(tid, False)
             is_in = self.zx1 < cx < self.zx2 and self.zy1 < cy < self.zy2
             if not was_in and is_in:
-                self._entry_events.append((now, tid))
+                # 去抖动：同一 tid 60s 窗口内已记录 entry 则不重复（zone 边缘抖动/检测闪烁）
+                if not any(t == tid for _, t in self._entry_events):
+                    self._entry_events.append((now, tid))
             elif was_in and not is_in:
-                self._exit_events.append((now, tid))
+                if not any(t == tid for _, t in self._exit_events):
+                    self._exit_events.append((now, tid))
             self._inside_zone[tid] = is_in
         _t.append(time.perf_counter())
 
@@ -599,8 +602,10 @@ class FrameProcessor:
         self._prune_events(now)
         ec = len(self._entry_events)
         xc = len(self._exit_events)
-        total = ec + xc
-        return {"entry_count": ec, "exit_count": xc, "flow_per_min": round(total, 1)}
+        # flow_per_min 取 max(entry, exit)：一辆车完整通过 zone 产生 1 entry + 1 exit，
+        # entry+exit 会双重计数导致偏高2倍；max 取进入或离开的较大值，更接近真实车辆数
+        flow = max(ec, xc)
+        return {"entry_count": ec, "exit_count": xc, "flow_per_min": round(flow, 1)}
 
     def _cleanup_trails(self):
         stale = [tid for tid, age in self.trail_age.items() if self.frame_count - age > TRAIL_MAX_AGE]
