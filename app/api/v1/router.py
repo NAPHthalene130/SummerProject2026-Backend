@@ -8,6 +8,7 @@ from app.api.v1.users import users_router
 from app.api.v1.work_orders import staff_router, work_orders_router
 from app.api.v1.mobile import router as mobile_router
 from app.api.v1.uploads import uploads_router
+from app.api.v1.roads import router as roads_router
 
 api_router = APIRouter()
 
@@ -20,6 +21,7 @@ api_router.include_router(staff_router, prefix="/staff", tags=["staff"])
 api_router.include_router(users_router, prefix="/users", tags=["users"])
 api_router.include_router(mobile_router, tags=["mobile"])
 api_router.include_router(uploads_router, prefix="/uploads", tags=["uploads"])
+api_router.include_router(roads_router, prefix="/roads", tags=["roads"])
 
 
 @api_router.get("/ping")
