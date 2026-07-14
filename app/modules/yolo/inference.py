@@ -58,6 +58,9 @@ class FrameProcessor:
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []  # 滑动窗口平滑车道数（30帧≈2s 取众数）
+        # 跳帧跟踪：每 _track_interval 帧做完整 ByteTrack，中间帧用简化 IoU 匹配
+        self._track_interval = 3
+        self._last_track_boxes: dict[int, list[float]] = {}  # track_id → bbox（供中间帧 IoU 匹配）
         self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=15)
         # 标注器在 __init__ 中创建一次复用，避免每帧 new 带来的 450 次/s 对象创建与 GC 压力
         self._box_annotator = sv.BoxAnnotator(color=COLOR_PALETTE, thickness=2)
@@ -97,10 +100,21 @@ class FrameProcessor:
         raw_boxes = [list(b) for b in (detections.xyxy.tolist() if detections.xyxy is not None else [])]
         _t.append(time.perf_counter())
 
-        if len(detections) > 0:
-            detections = self.tracker.update_with_detections(detections)
+        # 跳帧跟踪：每 _track_interval 帧做完整 ByteTrack（卡尔曼滤波+匈牙利匹配），
+        # 中间帧用简化 IoU 匹配（<1ms），保持 track_id 连续，不丢 ID，不影响车流量计算。
+        do_full_track = (self.frame_count % self._track_interval == 0)
+        if do_full_track:
+            if len(detections) > 0:
+                detections = self.tracker.update_with_detections(detections)
+            else:
+                detections = sv.Detections.empty()
+            # 保存跟踪结果供中间帧 IoU 匹配
+            self._last_track_boxes = {}
+            if len(detections) > 0 and detections.tracker_id is not None:
+                for i in range(len(detections)):
+                    self._last_track_boxes[int(detections.tracker_id[i])] = detections.xyxy[i].tolist()
         else:
-            detections = sv.Detections.empty()
+            detections = self._simple_iou_match(detections)
         _t.append(time.perf_counter())
 
         actual_tids: set[int] = set()
@@ -128,6 +142,14 @@ class FrameProcessor:
                 cls_name = self.class_names.get(cid, "?")
                 conf = float(filtered.confidence[i]) if filtered.confidence is not None else 0.0
                 xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
+                detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
+
+                # tid=-1 表示跳帧中间帧 IoU 未匹配的检测框，跳过轨迹/速度/zone 逻辑
+                # 不影响车流量统计（不触发 entry/exit），速度为 0
+                if tid == -1:
+                    speed_map[tid] = 0.0
+                    continue
+
                 cx = (xyxy[0] + xyxy[2]) / 2
                 cy = (xyxy[1] + xyxy[3]) / 2
 
@@ -229,6 +251,52 @@ class FrameProcessor:
             remaining = np.where(iou <= NMS_OVERLAP)[0]
             order = order[remaining + 1]
         return detections[keep]
+
+    def _simple_iou_match(self, detections: sv.Detections) -> sv.Detections:
+        """简化 IoU 匹配，用于跳帧跟踪的中间帧。
+
+        将当前帧 YOLO 检测框与上一次 ByteTrack 的 track_id→bbox 做 IoU 匹配，
+        保持 track_id 连续（不丢 ID，不影响车流量计算）。开销 <1ms。
+        未匹配的检测框 track_id=-1（不影响速度/车流量，下次 ByteTrack 帧重新分配）。
+        """
+        if len(detections) == 0 or len(self._last_track_boxes) == 0:
+            return detections
+
+        det_boxes = np.asarray(detections.xyxy, dtype=np.float32)
+        track_ids = list(self._last_track_boxes.keys())
+        track_boxes = np.array([self._last_track_boxes[tid] for tid in track_ids], dtype=np.float32)
+
+        # 向量化 IoU 矩阵 (N, M)
+        x1 = np.maximum(det_boxes[:, 0:1], track_boxes[:, 0:1].T)
+        y1 = np.maximum(det_boxes[:, 1:2], track_boxes[:, 1:2].T)
+        x2 = np.minimum(det_boxes[:, 2:3], track_boxes[:, 2:3].T)
+        y2 = np.minimum(det_boxes[:, 3:4], track_boxes[:, 3:4].T)
+        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        area_det = (det_boxes[:, 2] - det_boxes[:, 0]) * (det_boxes[:, 3] - det_boxes[:, 1])
+        area_track = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
+        iou = inter / (area_det[:, None] + area_track[None, :] - inter + 1e-6)
+
+        # 贪心匹配：每个检测框匹配 IoU 最大的轨迹（阈值 0.3）
+        N = len(det_boxes)
+        tracker_ids = np.full(N, -1, dtype=int)
+        used = set()
+        for i in range(N):
+            best_j = -1
+            best_iou = 0.3
+            for j in range(len(track_ids)):
+                if j in used:
+                    continue
+                if iou[i, j] > best_iou:
+                    best_iou = iou[i, j]
+                    best_j = j
+            if best_j >= 0:
+                tracker_ids[i] = track_ids[best_j]
+                used.add(best_j)
+                # 更新轨迹 bbox 供下一中间帧匹配
+                self._last_track_boxes[track_ids[best_j]] = det_boxes[i].tolist()
+
+        detections.tracker_id = tracker_ids
+        return detections
 
     def _calc_speed(self, track_id: int, cx: float, cy: float, now: float) -> float:
         traj = self._trajectories.setdefault(track_id, [])
