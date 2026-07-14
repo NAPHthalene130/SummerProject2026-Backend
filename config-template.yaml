@@ -49,7 +49,7 @@ yolo:
   batch_size: 30
   post_workers: 8
   opencv_threads: 1
-  batch_collect_ms: 5.0
+  batch_collect_ms: 66.0
   image_size: 640
   half: true
 
