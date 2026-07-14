@@ -392,7 +392,7 @@ class FrameProcessor:
         elif new_kmh < 20.0:
             new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
         # EMA 平滑（避免抖动）
-        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
+        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
 
         self._speed_stable[track_id] = new_kmh
@@ -436,7 +436,7 @@ class FrameProcessor:
             new_kmh = 0.0      # <2km/h 视为静止（停车/噪声）
         elif new_kmh < 20.0:
             new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
-        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
+        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
 
         self._speed_stable[track_id] = new_kmh
