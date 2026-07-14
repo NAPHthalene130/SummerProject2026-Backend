@@ -91,11 +91,13 @@ class FrameProcessor:
         now = time.time()
         _t = [time.perf_counter()]
 
-        # 1. 从 results 提取 numpy 数组（不构造 sv.Detections，减少 GIL）
+        # 1. 从 results 一次性提取 numpy 数组（1 次 .cpu() 代替 3 次，减少 CUDA 同步开销）
         if hasattr(results, 'boxes') and results.boxes is not None and len(results.boxes) > 0:
-            xyxy = results.boxes.xyxy.cpu().numpy().astype(np.float32)
-            conf = results.boxes.conf.cpu().numpy().astype(np.float32)
-            cls = results.boxes.cls.cpu().numpy().astype(np.int32)
+            # ultralytics Boxes.data 是 (N, 6) = [x1, y1, x2, y2, conf, cls]，1 次 GPU→CPU 传输
+            raw = results.boxes.data.cpu().numpy()
+            xyxy = raw[:, :4].astype(np.float32)
+            conf = raw[:, 4].astype(np.float32)
+            cls = raw[:, 5].astype(np.int32)
         else:
             xyxy = np.empty((0, 4), dtype=np.float32)
             conf = np.empty(0, dtype=np.float32)
@@ -346,15 +348,12 @@ class FrameProcessor:
         pts = self._trajectories[track_id]
 
         vel_kmh = self._speed_stable.get(track_id, 0.0)
-        lu = self._speed_last_update.get(track_id, 0.0)
-        if now - lu < 0.6:
-            return vel_kmh
 
         if len(pts) < 2:
             self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
             return vel_kmh
 
-        # 简单位移/时间（替代 polyfit，减少 ~1ms GIL）
+        # 简位移植/时间（替代 polyfit，减少 GIL）— 去掉 0.6s 限制，每帧都计算
         first = pts[0]
         last = pts[-1]
         dx = last[0] - first[0]
@@ -368,10 +367,11 @@ class FrameProcessor:
         scale = self._perspective_scale(avg_cy)
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
-        if new_kmh < 0.5:
+        if new_kmh < 1.0:
             new_kmh = 0.0
-        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 8:
-            new_kmh = vel_kmh * 0.7 + new_kmh * 0.3
+        # EMA 平滑（避免抖动）
+        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
+            new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
