@@ -222,16 +222,21 @@ class FrameProcessor:
         return detections[keep]
 
     def _simple_iou_match(self, detections: sv.Detections) -> sv.Detections:
-        """简化 IoU 匹配，用于跳帧跟踪的中间帧。
+        """纯 IoU 跟踪：将当前帧检测框与上次轨迹做 IoU 匹配。
 
-        将当前帧 YOLO 检测框与上一次 ByteTrack 的 track_id→bbox 做 IoU 匹配，
-        保持 track_id 连续（不丢 ID，不影响车流量计算）。开销 <1ms。
-        未匹配的检测框 track_id=-1（不影响速度/车流量，下次 ByteTrack 帧重新分配）。
+        向量化匹配（numpy argmax + 降序贪心），避免 Python 双重 for 循环。
+        清理旧轨迹（超过 50 个时删除最旧），防止 M 持续增长。
         """
         if len(detections) == 0:
             return detections
+
+        # 清理旧轨迹（超过 50 个时只保留最近 50 个）
+        if len(self._last_track_boxes) > 50:
+            sorted_ids = sorted(self._last_track_boxes.keys())
+            for tid in sorted_ids[:-50]:
+                del self._last_track_boxes[tid]
+
         if len(self._last_track_boxes) == 0:
-            # 无历史轨迹（第一帧），为所有检测框分配新 ID
             N = len(detections)
             tracker_ids = np.arange(self._next_track_id, self._next_track_id + N, dtype=int)
             for i in range(N):
@@ -241,10 +246,10 @@ class FrameProcessor:
             return detections
 
         det_boxes = np.asarray(detections.xyxy, dtype=np.float32)
-        track_ids = list(self._last_track_boxes.keys())
+        track_ids = np.array(list(self._last_track_boxes.keys()), dtype=int)
         track_boxes = np.array([self._last_track_boxes[tid] for tid in track_ids], dtype=np.float32)
 
-        # 向量化 IoU 矩阵 (N, M)
+        # 向量化 IoU 矩阵 (N, M) — 全 numpy，释放 GIL
         x1 = np.maximum(det_boxes[:, 0:1], track_boxes[:, 0:1].T)
         y1 = np.maximum(det_boxes[:, 1:2], track_boxes[:, 1:2].T)
         x2 = np.minimum(det_boxes[:, 2:3], track_boxes[:, 2:3].T)
@@ -254,25 +259,22 @@ class FrameProcessor:
         area_track = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
         iou = inter / (area_det[:, None] + area_track[None, :] - inter + 1e-6)
 
-        # 贪心匹配：每个检测框匹配 IoU 最大的轨迹（阈值 0.3）
+        # 向量化匹配：argmax + 降序贪心（仅 N 次 Python 循环，非 N×M）
         N = len(det_boxes)
+        best_j = np.argmax(iou, axis=1)  # (N,) 每个检测框的最佳轨迹索引
+        best_iou = iou[np.arange(N), best_j]  # (N,) 最佳 IoU 值
+        order = np.argsort(-best_iou)  # 按 IoU 降序排列
+
         tracker_ids = np.full(N, -1, dtype=int)
         used = set()
-        for i in range(N):
-            best_j = -1
-            best_iou = 0.3
-            for j in range(len(track_ids)):
-                if j in used:
-                    continue
-                if iou[i, j] > best_iou:
-                    best_iou = iou[i, j]
-                    best_j = j
-            if best_j >= 0:
-                tracker_ids[i] = track_ids[best_j]
-                used.add(best_j)
-                self._last_track_boxes[track_ids[best_j]] = det_boxes[i].tolist()
+        for idx in order:
+            j = int(best_j[idx])
+            if best_iou[idx] > 0.3 and j not in used:
+                tracker_ids[idx] = track_ids[j]
+                used.add(j)
+                self._last_track_boxes[int(track_ids[j])] = det_boxes[idx].tolist()
 
-        # 未匹配的检测框分配新 ID（保证车流量计数正确）
+        # 未匹配的分配新 ID
         for i in range(N):
             if tracker_ids[i] == -1:
                 tracker_ids[i] = self._next_track_id
