@@ -47,7 +47,7 @@ rtsp:
 yolo:
   model_path: ""
   batch_size: 30
-  post_workers: 8
+  post_workers: 20
   opencv_threads: 1
   batch_collect_ms: 66.0
   image_size: 640
