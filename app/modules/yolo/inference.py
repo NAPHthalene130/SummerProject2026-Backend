@@ -129,7 +129,7 @@ class FrameProcessor:
                         actual_tids.add(tid)
                         break
 
-        idx = [i for i in range(len(detections)) if int(detections.tracker_id[i]) in actual_tids]
+        idx = [i for i in range(len(detections)) if detections.tracker_id is not None and int(detections.tracker_id[i]) in actual_tids]
         filtered = detections[idx] if len(detections) > 0 and idx else detections
 
         detection_list: list[dict] = []
@@ -259,7 +259,11 @@ class FrameProcessor:
         保持 track_id 连续（不丢 ID，不影响车流量计算）。开销 <1ms。
         未匹配的检测框 track_id=-1（不影响速度/车流量，下次 ByteTrack 帧重新分配）。
         """
-        if len(detections) == 0 or len(self._last_track_boxes) == 0:
+        if len(detections) == 0:
+            return detections
+        if len(self._last_track_boxes) == 0:
+            # 无历史轨迹，所有检测框 track_id=-1（下次 ByteTrack 帧重新分配）
+            detections.tracker_id = np.full(len(detections), -1, dtype=int)
             return detections
 
         det_boxes = np.asarray(detections.xyxy, dtype=np.float32)
