@@ -177,6 +177,11 @@ class AppSettings:
 
         self.RISK_MODEL_PATH: str = val("risk", "model_path", "", env_var="SP2026_RISK_MODEL_PATH")
 
+        self.LANE_SEG_ENABLED: bool = val("lane_segmentation", "enabled", False, coerce=_bool_coerce, env_var="SP2026_LANE_SEG_ENABLED")
+        self.LANE_SEG_MODEL_PATH: str = val("lane_segmentation", "model_path", "", env_var="SP2026_LANE_SEG_MODEL_PATH")
+        self.LANE_SEG_INTERVAL: float = val("lane_segmentation", "interval", 5.0, coerce=_float_coerce, env_var="SP2026_LANE_SEG_INTERVAL")
+        self.LANE_SEG_IMAGE_SIZE: int = val("lane_segmentation", "image_size", 640, coerce=_int_coerce, env_var="SP2026_LANE_SEG_IMAGE_SIZE")
+
 
 _yaml_data = load_yaml_config()
 settings = AppSettings(_yaml_data)
