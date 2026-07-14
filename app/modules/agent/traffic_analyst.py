@@ -32,6 +32,18 @@ MIN_INCIDENT_CONFIDENCE = 0.85
 FRAME_BUFFER_SIZE = 5
 JPEG_QUALITY = 85
 
+INCIDENT_CATEGORY_MAP: dict[str, str] = {
+    "车辆碰撞": "traffic_police",
+    "车辆起火": "emergency_fire",
+    "交通拥堵": "traffic_coordination",
+    "行人闯入": "traffic_police",
+    "恶劣天气": "road_maintenance",
+    "车辆抛锚": "vehicle_rescue",
+    "异常停车": "traffic_police",
+    "道路障碍": "road_maintenance",
+    "其他事故": "traffic_police",
+}
+
 
 class TrafficAnalyst:
     _instance: Optional["TrafficAnalyst"] = None
@@ -497,6 +509,7 @@ class TrafficAnalyst:
         cam_config = CameraManager().get_by_id(camera_id)
         camera_name = cam_config.name if cam_config else camera_id
         rank = get_incident_rank(incident.incident_type)
+        required_category = INCIDENT_CATEGORY_MAP.get(incident.incident_type, "traffic_police")
         work_order = WorkOrderRepository.create_work_order(
             camera_id=camera_id,
             camera_name=camera_name,
@@ -504,6 +517,7 @@ class TrafficAnalyst:
             description=incident.description,
             rank=rank,
             image_url=image_path,
+            required_category=required_category,
         )
         if work_order:
             logger.info(

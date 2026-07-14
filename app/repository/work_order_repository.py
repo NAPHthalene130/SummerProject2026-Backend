@@ -231,8 +231,6 @@ class WorkOrderRepository:
                         f"工单当前状态为 '{order_row.get('work_order_stage')}',"
                         f"仅未派发(unassigned)工单可派发"
                     )
-                if (order_row.get("required_category") or "traffic_police") != (user_row.get("personnel_category") or "traffic_police"):
-                    raise ValueError("人员类别与工单要求不匹配")
                 cursor.execute(
                     """
                     INSERT INTO order_user (work_order_id, user_id, order_user_status)
