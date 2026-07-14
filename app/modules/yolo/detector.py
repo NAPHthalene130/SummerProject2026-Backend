@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 import time
 from pathlib import Path
@@ -9,6 +8,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from app.config import settings
 from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class YOLODetector:
     def __init__(self, model_path: str | None = None):
-        model_path = model_path or os.getenv("SP2026_YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH))
+        model_path = model_path or settings.YOLO_MODEL_PATH or str(DEFAULT_MODEL_PATH)
         self.model_path = model_path
         self._fps = 0.0
         self._frame_count = 0

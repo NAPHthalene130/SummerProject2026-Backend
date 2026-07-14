@@ -1,20 +1,18 @@
+import json
 import os
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 from urllib.parse import quote_plus
 
 import yaml
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
-
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 
 def load_yaml_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
-        return {}
+        raise FileNotFoundError(f"Configuration file not found: {CONFIG_PATH}")
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
@@ -25,6 +23,52 @@ def load_yaml_config() -> dict[str, Any]:
     return data
 
 
+def _yaml_val(yaml_data: dict, section: str, key: str, default: Any, *,
+              env_var: str = "", coerce=None) -> Any:
+    section_data = yaml_data.get(section, {})
+    if not isinstance(section_data, dict):
+        section_data = {}
+    yv = section_data.get(key, default)
+    ev = os.getenv(env_var or "")
+    if ev not in (None, ""):
+        raw = ev
+    elif yv is not None:
+        raw = yv
+    else:
+        raw = default
+    if coerce is not None and raw is not None:
+        try:
+            return coerce(raw)
+        except (ValueError, TypeError):
+            return default
+    return raw
+
+
+def _bool_coerce(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "yes")
+
+
+def _int_coerce(raw) -> int:
+    return int(raw)
+
+
+def _float_coerce(raw) -> float:
+    return float(raw)
+
+
+def _list_coerce(raw):
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return [raw]
+
+
 class DatabaseSettings(BaseModel):
     host: str = "127.0.0.1"
     port: int = 3306
@@ -32,6 +76,18 @@ class DatabaseSettings(BaseModel):
     password: str = "123456"
     name: str = "summer_project_2026"
     charset: str = "utf8mb4"
+
+    @classmethod
+    def from_yaml(cls, yaml_data: dict) -> "DatabaseSettings":
+        db = yaml_data.get("database", {}) or {}
+        return cls(
+            host=db.get("host", cls.model_fields["host"].default),
+            port=int(db.get("port", cls.model_fields["port"].default)),
+            username=db.get("username", cls.model_fields["username"].default),
+            password=db.get("password", cls.model_fields["password"].default),
+            name=db.get("name", cls.model_fields["name"].default),
+            charset=db.get("charset", cls.model_fields["charset"].default),
+        )
 
     @property
     def sqlalchemy_url(self) -> str:
@@ -47,6 +103,15 @@ class LLMSettings(BaseModel):
     api_key: str = "your_api_key_here"
     model_name: str = "your_model_name_here"
 
+    @classmethod
+    def from_yaml(cls, yaml_data: dict) -> "LLMSettings":
+        llm = yaml_data.get("llm", {}) or {}
+        return cls(
+            url=llm.get("url", cls.model_fields["url"].default),
+            api_key=llm.get("api_key", cls.model_fields["api_key"].default),
+            model_name=llm.get("model_name", cls.model_fields["model_name"].default),
+        )
+
 
 class EmbeddingSettings(BaseModel):
     url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -56,112 +121,65 @@ class EmbeddingSettings(BaseModel):
     concurrency: int = Field(default=10, ge=1)
     timeout: float = Field(default=60.0, gt=0)
 
-
-class Settings(BaseSettings):
-    PROJECT_NAME: str = "SummerProject2026"
-    VERSION: str = "0.1.0"
-    DESCRIPTION: str = "Traffic monitoring and management system API"
-    DEBUG: bool = True
-
-    HOST: str = "0.0.0.0"
-    PORT: int = 8000
-
-    API_V1_PREFIX: str = "/api/v1"
-    ENABLE_STREAMING: bool = True
-    ENABLE_TRAFFIC_ANALYST: bool = True
-
-    # 30-channel RTSP / YOLO pipeline.  Keeping these in BaseSettings makes the
-    # same SP2026_* values work both as real environment variables and in .env.
-    STREAM_FPS: int = Field(default=15, ge=1, le=60)
-    DETECT_RESIZE_WIDTH: int = Field(default=0, ge=0)
-    RTSP_OPEN_TIMEOUT_MS: int = Field(default=5000, ge=1000)
-    RTSP_READ_TIMEOUT_MS: int = Field(default=5000, ge=1000)
-    RTSP_CONNECT_CONCURRENCY: int = Field(default=4, ge=1, le=30)
-    RTSP_RECONNECT_DELAY: float = Field(default=1.0, ge=0.1)
-    RTSP_MAX_RECONNECT_DELAY: float = Field(default=30.0, ge=0.1)
-    RTSP_STARTUP_SPREAD_SECONDS: float = Field(default=2.0, ge=0.0)
-    RTSP_STALE_FRAME_SECONDS: float = Field(default=6.0, ge=1.0)
-    PROCESSED_STALE_FRAME_SECONDS: float = Field(default=8.0, ge=1.0)
-    RTSP_HW_ACCELERATION: bool = False
-
-    YOLO_MODEL_PATH: str = ""
-    YOLO_BATCH_SIZE: int = Field(default=8, ge=1)
-    YOLO_POST_WORKERS: int = Field(default=8, ge=1, le=64)
-    OPENCV_THREADS: int = Field(default=1, ge=1, le=16)
-    YOLO_BATCH_COLLECT_MS: float = Field(default=8.0, ge=0.0, le=100.0)
-    YOLO_IMAGE_SIZE: int = Field(default=640, ge=32)
-    YOLO_HALF: bool = True
-
-    # 热重载：开启后 uvicorn 的 watchfiles 会监视整个后端目录（含 logs/、data/orderImg/、__pycache__/），
-    # 任意文件写入都会触发"change detected"并可能在 .py 变更时整进程重启。
-    # 重启需重新加载 YOLO 权重到 GPU、重连 30 路 RTSP，期间 FPS 归零 6~200s —— 这正是"时而卡顿"的根因。
-    # 生产/监控运行必须关闭；开发时可用 SP2026_RELOAD=true 临时开启。
-    RELOAD: bool = False
-
-    CORS_ORIGINS: List[str] = ["*"]
-
-    model_config = {
-        "env_file": ".env",
-        "env_prefix": "SP2026_",
-        "case_sensitive": True,
-    }
+    @classmethod
+    def from_yaml(cls, yaml_data: dict) -> "EmbeddingSettings":
+        emb = yaml_data.get("embedding", {}) or {}
+        return cls(
+            url=emb.get("url", cls.model_fields["url"].default),
+            api_key=emb.get("api_key", cls.model_fields["api_key"].default),
+            model_name=emb.get("model_name", cls.model_fields["model_name"].default),
+            dimensions=int(emb.get("dimensions", cls.model_fields["dimensions"].default)),
+            concurrency=int(emb.get("concurrency", cls.model_fields["concurrency"].default)),
+            timeout=float(emb.get("timeout", cls.model_fields["timeout"].default)),
+        )
 
 
-settings = Settings()
+class AppSettings:
+    def __init__(self, yaml_data: dict | None = None):
+        if yaml_data is None:
+            yaml_data = load_yaml_config()
+
+        self.PROJECT_NAME: str = "SummerProject2026"
+        self.VERSION: str = "0.1.0"
+        self.DESCRIPTION: str = "Traffic monitoring and management system API"
+        self.API_V1_PREFIX: str = "/api/v1"
+
+        val = lambda s, k, d, coerce=None, env_var="": _yaml_val(yaml_data, s, k, d, env_var=env_var, coerce=coerce)
+
+        self.HOST: str = val("server", "host", "0.0.0.0", env_var="SP2026_HOST")
+        self.PORT: int = val("server", "port", 8000, coerce=_int_coerce, env_var="SP2026_PORT")
+        self.DEBUG: bool = val("server", "debug", True, coerce=_bool_coerce, env_var="SP2026_DEBUG")
+        self.RELOAD: bool = val("server", "reload", False, coerce=_bool_coerce, env_var="SP2026_RELOAD")
+        self.CORS_ORIGINS: list[str] = val("server", "cors_origins", ["*"], coerce=_list_coerce, env_var="SP2026_CORS_ORIGINS")
+
+        self.ENABLE_STREAMING: bool = val("streaming", "enabled", True, coerce=_bool_coerce, env_var="SP2026_ENABLE_STREAMING")
+        self.ENABLE_TRAFFIC_ANALYST: bool = val("streaming", "traffic_analyst_enabled", True, coerce=_bool_coerce, env_var="SP2026_ENABLE_TRAFFIC_ANALYST")
+        self.STREAM_FPS: int = val("streaming", "fps", 15, coerce=_int_coerce, env_var="SP2026_STREAM_FPS")
+        self.DETECT_RESIZE_WIDTH: int = val("streaming", "detect_resize_width", 0, coerce=_int_coerce, env_var="SP2026_DETECT_RESIZE_WIDTH")
+
+        self.RTSP_OPEN_TIMEOUT_MS: int = val("rtsp", "open_timeout_ms", 5000, coerce=_int_coerce, env_var="SP2026_RTSP_OPEN_TIMEOUT_MS")
+        self.RTSP_READ_TIMEOUT_MS: int = val("rtsp", "read_timeout_ms", 5000, coerce=_int_coerce, env_var="SP2026_RTSP_READ_TIMEOUT_MS")
+        self.RTSP_CONNECT_CONCURRENCY: int = val("rtsp", "connect_concurrency", 4, coerce=_int_coerce, env_var="SP2026_RTSP_CONNECT_CONCURRENCY")
+        self.RTSP_RECONNECT_DELAY: float = val("rtsp", "reconnect_delay", 1.0, coerce=_float_coerce, env_var="SP2026_RTSP_RECONNECT_DELAY")
+        self.RTSP_MAX_RECONNECT_DELAY: float = val("rtsp", "max_reconnect_delay", 30.0, coerce=_float_coerce, env_var="SP2026_RTSP_MAX_RECONNECT_DELAY")
+        self.RTSP_STARTUP_SPREAD_SECONDS: float = val("rtsp", "startup_spread_seconds", 2.0, coerce=_float_coerce, env_var="SP2026_RTSP_STARTUP_SPREAD_SECONDS")
+        self.RTSP_STALE_FRAME_SECONDS: float = val("rtsp", "stale_frame_seconds", 6.0, coerce=_float_coerce, env_var="SP2026_RTSP_STALE_FRAME_SECONDS")
+        self.PROCESSED_STALE_FRAME_SECONDS: float = val("rtsp", "processed_stale_frame_seconds", 8.0, coerce=_float_coerce, env_var="SP2026_PROCESSED_STALE_FRAME_SECONDS")
+        self.RTSP_HW_ACCELERATION: bool = val("rtsp", "hw_acceleration", False, coerce=_bool_coerce, env_var="SP2026_RTSP_HW_ACCELERATION")
+
+        self.YOLO_MODEL_PATH: str = val("yolo", "model_path", "", env_var="SP2026_YOLO_MODEL_PATH")
+        self.YOLO_BATCH_SIZE: int = val("yolo", "batch_size", 8, coerce=_int_coerce, env_var="SP2026_YOLO_BATCH_SIZE")
+        self.YOLO_POST_WORKERS: int = val("yolo", "post_workers", 8, coerce=_int_coerce, env_var="SP2026_YOLO_POST_WORKERS")
+        self.OPENCV_THREADS: int = val("yolo", "opencv_threads", 1, coerce=_int_coerce, env_var="SP2026_OPENCV_THREADS")
+        self.YOLO_BATCH_COLLECT_MS: float = val("yolo", "batch_collect_ms", 8.0, coerce=_float_coerce, env_var="SP2026_YOLO_BATCH_COLLECT_MS")
+        self.YOLO_IMAGE_SIZE: int = val("yolo", "image_size", 640, coerce=_int_coerce, env_var="SP2026_YOLO_IMAGE_SIZE")
+        self.YOLO_HALF: bool = val("yolo", "half", True, coerce=_bool_coerce, env_var="SP2026_YOLO_HALF")
+
+        self.RISK_MODEL_PATH: str = val("risk", "model_path", "", env_var="SP2026_RISK_MODEL_PATH")
 
 
-@lru_cache
-def get_database_settings() -> DatabaseSettings:
-    data = dict(load_yaml_config().get("database", {}))
-    environment_values = {
-        "host": os.getenv("SP2026_DB_HOST"),
-        "port": os.getenv("SP2026_DB_PORT"),
-        "username": os.getenv("SP2026_DB_USERNAME"),
-        "password": os.getenv("SP2026_DB_PASSWORD"),
-        "name": os.getenv("SP2026_DB_NAME"),
-        "charset": os.getenv("SP2026_DB_CHARSET"),
-    }
-    data.update({key: value for key, value in environment_values.items() if value not in {None, ""}})
-    return DatabaseSettings.model_validate(data)
-
-
-database_settings = get_database_settings()
-
-
-@lru_cache
-def get_llm_settings() -> LLMSettings:
-    data = dict(load_yaml_config().get("llm", {}))
-    environment_values = {
-        "url": os.getenv("SP2026_LLM_URL"),
-        "api_key": os.getenv("SP2026_LLM_API_KEY"),
-        "model_name": os.getenv("SP2026_LLM_MODEL_NAME"),
-    }
-    data.update({key: value for key, value in environment_values.items() if value not in {None, ""}})
-    return LLMSettings.model_validate(data)
-
-
-llm_settings = get_llm_settings()
-
-
-@lru_cache
-def get_embedding_settings() -> EmbeddingSettings:
-    data = dict(load_yaml_config().get("embedding", {}))
-    environment_values = {
-        "url": os.getenv("SP2026_EMBEDDING_URL"),
-        "api_key": os.getenv("SP2026_EMBEDDING_API_KEY"),
-        "model_name": os.getenv("SP2026_EMBEDDING_MODEL_NAME"),
-        "dimensions": os.getenv("SP2026_EMBEDDING_DIMENSIONS"),
-        "concurrency": os.getenv("SP2026_EMBEDDING_CONCURRENCY"),
-        "timeout": os.getenv("SP2026_EMBEDDING_TIMEOUT"),
-    }
-    data.update(
-        {
-            key: value
-            for key, value in environment_values.items()
-            if value not in {None, ""}
-        }
-    )
-    return EmbeddingSettings.model_validate(data)
-
-
-embedding_settings = get_embedding_settings()
+_yaml_data = load_yaml_config()
+settings = AppSettings(_yaml_data)
+database_settings = DatabaseSettings.from_yaml(_yaml_data)
+llm_settings = LLMSettings.from_yaml(_yaml_data)
+embedding_settings = EmbeddingSettings.from_yaml(_yaml_data)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from app.config import settings
 from app.modules.camera_data import CameraDataStore
 
 
@@ -52,7 +52,8 @@ class _CacheEntry:
 class LiveRiskPredictionService:
     def __init__(self) -> None:
         default_model = Path(__file__).resolve().parent / "models" / "catboost_risk_model.joblib"
-        self.model_path = Path(os.getenv("SP2026_RISK_MODEL_PATH", str(default_model)))
+        configured = settings.RISK_MODEL_PATH
+        self.model_path = Path(configured) if configured else default_model
         self._model: Any | None = None
         self._model_lock = threading.Lock()
         self._weather_cache: dict[str, _CacheEntry] = {}

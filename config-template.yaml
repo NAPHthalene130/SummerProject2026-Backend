@@ -1,3 +1,11 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+  reload: false
+  cors_origins:
+    - "*"
+
 database:
   host: "127.0.0.1"
   port: 3306
@@ -16,9 +24,37 @@ embedding:
   api_key: "your_api_key_here"
   model_name: "text-embedding-v4"
   dimensions: 1024
-  # 每条法条单独请求 embedding，最多同时处理 10 条。
   concurrency: 10
   timeout: 60.0
+
+streaming:
+  enabled: true
+  traffic_analyst_enabled: true
+  fps: 15
+  detect_resize_width: 0
+
+rtsp:
+  open_timeout_ms: 5000
+  read_timeout_ms: 5000
+  connect_concurrency: 4
+  reconnect_delay: 1.0
+  max_reconnect_delay: 30.0
+  startup_spread_seconds: 2.0
+  stale_frame_seconds: 6.0
+  processed_stale_frame_seconds: 8.0
+  hw_acceleration: false
+
+yolo:
+  model_path: ""
+  batch_size: 8
+  post_workers: 8
+  opencv_threads: 1
+  batch_collect_ms: 8.0
+  image_size: 640
+  half: true
+
+risk:
+  model_path: ""
 
 cameras:
   - id: "cam-01"

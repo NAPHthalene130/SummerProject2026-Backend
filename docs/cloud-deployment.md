@@ -13,13 +13,24 @@ Android 只需要访问公开的 HTTPS 域名，例如 `https://traffic-api.exam
 服务器安装 Docker 和 Docker Compose 后：
 
 ```bash
-cp .env.cloud.example .env
-# 修改 .env 中的数据库密码
+# 1. 从模板创建 config.yaml（含 RTSP/YOLO/LLM/摄像头等全部配置）
+cp config-template.yaml config.yaml
+# 修改 config.yaml 中的数据库密码、API Key 等敏感信息
+
+# 2. 创建 docker-compose 环境变量文件（仅数据库凭证和镜像名）
+cat > .env << 'EOF'
+MYSQL_ROOT_PASSWORD=your-strong-root-password
+SP2026_DB_USERNAME=summer_project
+SP2026_DB_PASSWORD=your-strong-db-password
+SP2026_DB_NAME=summer_project_2026
+EOF
+
+# 3. 启动服务
 docker compose -f docker-compose.cloud.yml up -d --build
 curl http://127.0.0.1:8000/health
 ```
 
-默认使用 API-only 模式，不启动 RTSP、YOLO 和交通分析智能体。需要这些服务时，再将对应环境变量改为 `true` 并提供摄像头及模型配置。
+所有应用配置（流媒体、RTSP、YOLO、LLM、摄像头列表等）统一在 `config.yaml` 中管理。`docker-compose.cloud.yml` 仅通过环境变量注入数据库连接信息，其余配置由容器内的 `config.yaml` 提供。
 
 CI/CD 会在 `dev`、`main` 分支测试通过后将镜像发布到 GHCR。云服务器使用已发布的不可变镜像时，在 `.env` 中设置完整镜像名（建议使用 `<branch>-<sha>` 标签），登录 GHCR 后执行：
 
@@ -59,18 +70,12 @@ https://traffic-api.example.com
 .\gradlew.bat :app:assembleDebug -PTRAFFIC_API_BASE_URL=https://traffic-api.example.com
 ```
 
-## 4. 云端环境变量
+## 4. 云端配置
 
-- `SP2026_DB_HOST`
-- `SP2026_API_IMAGE`
-- `SP2026_DB_PORT`
-- `SP2026_DB_USERNAME`
-- `SP2026_DB_PASSWORD`
-- `SP2026_DB_NAME`
-- `SP2026_ENABLE_STREAMING`
-- `SP2026_ENABLE_TRAFFIC_ANALYST`
-- `SP2026_LLM_URL`
-- `SP2026_LLM_API_KEY`
-- `SP2026_LLM_MODEL_NAME`
+所有应用配置统一在 `config.yaml` 中管理（streaming、RTSP、YOLO、LLM、Embedding、摄像头列表等）。Docker Compose 仅注入数据库连接信息：
+
+- `MYSQL_ROOT_PASSWORD` — MySQL root 密码
+- `SP2026_DB_USERNAME` / `SP2026_DB_PASSWORD` / `SP2026_DB_NAME` — 应用数据库凭证
+- `SP2026_API_IMAGE` — 使用的容器镜像名（可选）
 
 不要将真实密码、API Key 或生产 `config.yaml` 提交到 Git。
