@@ -56,6 +56,15 @@ yolo:
 risk:
   model_path: ""
 
+# 道路分割（车道线检测）独立推理 worker。
+# model_path 为空时 worker 不启动，inference.py 回退到 _estimate_lanes() + 滑动窗口平滑。
+# 配置车道线分割模型路径后，worker 每 interval 秒对 30 路串行推理，结果缓存到 CameraDataStore.lane_count。
+lane_segmentation:
+  enabled: false
+  model_path: ""
+  interval: 5.0
+  image_size: 640
+
 cameras:
   - id: "cam-01"
     name: "苏州街-海淀南路"
