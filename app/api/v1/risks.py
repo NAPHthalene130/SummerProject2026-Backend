@@ -19,6 +19,8 @@ class RoadPredictionInput(BaseModel):
     camera_ids: list[str] = Field(default_factory=list)
     traffic_flow: float = Field(default=60, ge=0)
     avg_speed: float = Field(default=40, ge=0)
+    historical_accidents_24h: int = Field(default=0, ge=0)
+    historical_accidents_7d: int = Field(default=0, ge=0)
 
 
 class RiskPredictionRequest(BaseModel):

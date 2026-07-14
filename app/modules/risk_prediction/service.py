@@ -42,6 +42,10 @@ MODEL_COLUMNS = [
     "dow_cos",
 ]
 
+PREDICTION_WINDOW_MINUTES = 15
+PREDICTION_WINDOW_SECONDS = PREDICTION_WINDOW_MINUTES * 60
+WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
 
 @dataclass
 class _CacheEntry:
@@ -70,10 +74,13 @@ class LiveRiskPredictionService:
 
     async def predict(self, segments: list[dict[str, Any]], selected_segment_id: str | None = None) -> dict[str, Any]:
         if not segments:
+            now = datetime.now()
             return {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "generated_at": now.isoformat(timespec="seconds"),
                 "model": self.model_path.name,
-                "forecast_minutes": 15,
+                "forecast_minutes": PREDICTION_WINDOW_MINUTES,
+                "aggregation_window_minutes": PREDICTION_WINDOW_MINUTES,
+                "date_context": self._date_context(now),
                 "weather": {},
                 "predictions": [],
             }
@@ -96,7 +103,7 @@ class LiveRiskPredictionService:
         rows: list[dict[str, Any]] = []
         evidence: list[dict[str, Any]] = []
         for segment in segments:
-            vehicle = self._vehicle_context(segment.get("camera_ids") or [])
+            vehicle = self._vehicle_context(segment, now)
             road_context = selected_context if segment.get("segment_id") == selected_segment_id else None
             row = self._build_model_row(segment, weather, vehicle, road_context, now)
             rows.append(row)
@@ -112,12 +119,27 @@ class LiveRiskPredictionService:
         scores = await asyncio.to_thread(self._predict_frame, frame)
 
         predictions = []
-        for segment, score, item_evidence in zip(segments, scores, evidence):
-            reasons = self._build_reasons(score, weather, item_evidence["vehicle"], item_evidence["road"])
+        for segment, raw_score, item_evidence in zip(segments, scores, evidence):
+            score = self._calibrate_score(
+                float(raw_score),
+                weather,
+                item_evidence["vehicle"],
+                item_evidence["road"],
+                segment,
+            )
+            reasons = self._build_reasons(
+                score,
+                weather,
+                item_evidence["vehicle"],
+                item_evidence["road"],
+                segment,
+                now,
+            )
             predictions.append(
                 {
                     "segment_id": str(segment["segment_id"]),
                     "risk_score": float(score),
+                    "model_score": float(raw_score),
                     "risk_level": self._risk_level(float(score)),
                     "reason": reasons,
                     **item_evidence,
@@ -127,7 +149,9 @@ class LiveRiskPredictionService:
         return {
             "generated_at": now.isoformat(timespec="seconds"),
             "model": self.model_path.name,
-            "forecast_minutes": 15,
+            "forecast_minutes": PREDICTION_WINDOW_MINUTES,
+            "aggregation_window_minutes": PREDICTION_WINDOW_MINUTES,
+            "date_context": self._date_context(now),
             "weather": weather,
             "predictions": predictions,
         }
@@ -257,26 +281,66 @@ class LiveRiskPredictionService:
         self._road_cache[key] = _CacheEntry(value, time.time() + 3600)
         return value
 
-    def _vehicle_context(self, camera_ids: list[str]) -> dict[str, Any]:
+    def _vehicle_context(self, segment: dict[str, Any], now: datetime) -> dict[str, Any]:
         store = CameraDataStore()
+        camera_ids = segment.get("camera_ids") or []
         backend_ids = [self._backend_camera_id(item) for item in camera_ids]
-        counts: list[int] = []
-        speeds: list[float] = []
+        instantaneous_counts: list[int] = []
+        window_counts: list[int] = []
+        speeds: list[tuple[float, int]] = []
+        observed_seconds: list[float] = []
         active_incidents = 0
         for camera_id in backend_ids:
             data = store.get_by_camera_id(camera_id)
             if data is not None:
-                counts.append(int(data.total_vehicle_count))
-            metrics = store.get_traffic_metrics(camera_id)
-            if metrics and metrics.get("avg_speed_kmh") is not None:
-                speeds.append(float(metrics["avg_speed_kmh"]))
+                instantaneous_counts.append(int(data.total_vehicle_count))
+            metrics = store.get_prediction_window_metrics(camera_id, PREDICTION_WINDOW_SECONDS)
+            window_counts.append(int(metrics["cumulative_vehicle_count"] or 0))
+            observed_seconds.append(float(metrics["observed_seconds"] or 0.0))
+            if metrics.get("avg_speed_kmh") is not None:
+                speeds.append((float(metrics["avg_speed_kmh"]), max(1, int(metrics["sample_count"] or 0))))
             active_incidents += len(store.get_active_incident_types(camera_id))
+
+        observed_minutes = max(observed_seconds, default=0.0) / 60.0
+        observed_vehicle_count = int(sum(window_counts))
+        baseline_flow = self._historical_flow_baseline(segment, now)
+        baseline_window_count = baseline_flow * PREDICTION_WINDOW_MINUTES
+        has_stable_window = observed_minutes >= 1.0 and observed_vehicle_count > 0
+        if has_stable_window:
+            flow_per_min = observed_vehicle_count / observed_minutes
+            window_vehicle_count = flow_per_min * PREDICTION_WINDOW_MINUTES
+            flow_source = "yolo-window"
+        else:
+            flow_per_min = baseline_flow
+            window_vehicle_count = baseline_window_count
+            flow_source = "historical-road-baseline"
+
+        speed_weight = sum(weight for _, weight in speeds)
+        window_speed = (
+            sum(speed * weight for speed, weight in speeds) / speed_weight
+            if speed_weight > 0
+            else float(segment.get("avg_speed") or segment.get("speed_limit") or 40.0)
+        )
+        change_percent = (
+            (window_vehicle_count - baseline_window_count) / baseline_window_count * 100.0
+            if baseline_window_count > 0
+            else 0.0
+        )
         return {
             "camera_ids": backend_ids,
-            "vehicle_count": int(sum(counts)),
-            "avg_speed_kmh": float(np.mean(speeds)) if speeds else None,
+            "vehicle_count": int(round(window_vehicle_count)),
+            "instantaneous_vehicle_count": int(sum(instantaneous_counts)),
+            "cumulative_vehicle_count": observed_vehicle_count,
+            "window_vehicle_count": int(round(window_vehicle_count)),
+            "window_minutes": PREDICTION_WINDOW_MINUTES,
+            "observed_minutes": round(observed_minutes, 1),
+            "flow_per_min": round(flow_per_min, 1),
+            "historical_baseline_count": int(round(baseline_window_count)),
+            "flow_change_percent": round(change_percent, 1),
+            "flow_comparison": self._comparison_text(change_percent),
+            "avg_speed_kmh": float(window_speed),
             "active_incidents": active_incidents,
-            "source": "yolo-camera-store" if counts else "segment-fallback",
+            "source": flow_source,
         }
 
     @staticmethod
@@ -295,9 +359,7 @@ class LiveRiskPredictionService:
         road: dict[str, Any] | None,
         now: datetime,
     ) -> dict[str, Any]:
-        vehicle_count = int(vehicle["vehicle_count"])
-        fallback_flow = float(segment.get("traffic_flow") or 60.0)
-        traffic_volume = max(float(vehicle_count * 12), fallback_flow if vehicle_count == 0 else 1.0)
+        traffic_volume = max(float(vehicle["flow_per_min"]), 1.0)
         speed_kmh = vehicle.get("avg_speed_kmh")
         if not speed_kmh or speed_kmh <= 0:
             speed_kmh = float(segment.get("avg_speed") or segment.get("speed_limit") or 40.0)
@@ -315,8 +377,8 @@ class LiveRiskPredictionService:
             "rain": weather["rain"],
             "snowfall": weather["snowfall"],
             "wind_speed_10m": weather["wind_speed_10m"],
-            "crashes_last_24h": float(vehicle["active_incidents"]),
-            "crashes_last_7d": float(vehicle["active_incidents"]),
+            "crashes_last_24h": float(segment.get("historical_accidents_24h") or 0.0),
+            "crashes_last_7d": float(segment.get("historical_accidents_7d") or 0.0),
             "hour": now.hour,
             "minute": now.minute,
             "day_of_week": day_of_week,
@@ -342,6 +404,45 @@ class LiveRiskPredictionService:
         }
 
     @staticmethod
+    def _calibrate_score(
+        model_score: float,
+        weather: dict[str, Any],
+        vehicle: dict[str, Any],
+        road: dict[str, Any],
+        segment: dict[str, Any],
+    ) -> float:
+        """Blend model output with road metadata absent from the trained feature set."""
+        adjustment = max(-0.12, min(0.18, float(vehicle["flow_change_percent"]) / 500.0))
+        speed_limit_value = road.get("maxspeed") or segment.get("speed_limit") or 0
+        try:
+            speed_limit = float(str(speed_limit_value).split()[0])
+        except (TypeError, ValueError):
+            speed_limit = 0.0
+        if speed_limit > 0:
+            speed_ratio = float(vehicle["avg_speed_kmh"]) / speed_limit
+            if speed_ratio < 0.4:
+                adjustment += 0.06
+            elif speed_ratio < 0.65:
+                adjustment += 0.03
+        if weather["rain"] > 0 or weather["snowfall"] > 0 or weather["wind_speed_10m"] >= 25:
+            adjustment += 0.04
+        if (road.get("road_type") or segment.get("road_type")) in {
+            "motorway",
+            "trunk",
+            "primary",
+            "main",
+        }:
+            adjustment += 0.02
+        lane_value = road.get("lanes") or segment.get("lane_count") or 0
+        try:
+            lane_count = float(str(lane_value).split()[0])
+        except (TypeError, ValueError):
+            lane_count = 0.0
+        if lane_count >= 4:
+            adjustment += 0.01
+        return float(np.clip(model_score + adjustment, 0.0, 1.0))
+
+    @staticmethod
     def _risk_level(score: float) -> str:
         if score < 0.3:
             return "normal"
@@ -350,31 +451,106 @@ class LiveRiskPredictionService:
         return "danger"
 
     @staticmethod
+    def _date_context(now: datetime) -> dict[str, Any]:
+        weekday_index = now.weekday()
+        return {
+            "date": now.strftime("%Y-%m-%d"),
+            "weekday": WEEKDAY_NAMES[weekday_index],
+            "weekday_index": weekday_index,
+            "is_weekend": weekday_index >= 5,
+            "period": LiveRiskPredictionService._period_name(now.hour),
+        }
+
+    @staticmethod
+    def _period_name(hour: int) -> str:
+        if 7 <= hour < 10:
+            return "早高峰"
+        if 17 <= hour < 20:
+            return "晚高峰"
+        if 0 <= hour < 6:
+            return "夜间低峰"
+        return "日间平峰"
+
+    @staticmethod
+    def _historical_flow_baseline(segment: dict[str, Any], now: datetime) -> float:
+        base_flow = max(float(segment.get("traffic_flow") or 1.0), 1.0)
+        weekday_factor = (0.98, 1.0, 1.0, 1.02, 1.08, 0.9, 0.82)[now.weekday()]
+        if 7 <= now.hour < 10 or 17 <= now.hour < 20:
+            period_factor = 1.2
+        elif 0 <= now.hour < 6:
+            period_factor = 0.55
+        else:
+            period_factor = 1.0
+        return base_flow * weekday_factor * period_factor
+
+    @staticmethod
+    def _comparison_text(change_percent: float) -> str:
+        if change_percent >= 10:
+            return "偏多"
+        if change_percent <= -10:
+            return "偏少"
+        return "基本持平"
+
+    @staticmethod
+    def _weather_text(weather: dict[str, Any]) -> str:
+        if weather["snowfall"] > 0:
+            condition = "降雪"
+        elif weather["rain"] > 0 or weather["precipitation"] > 0:
+            condition = "降雨"
+        elif weather["wind_speed_10m"] >= 25:
+            condition = "大风"
+        else:
+            condition = "无明显降水"
+        fallback_note = "（天气服务暂不可用，采用默认值）" if weather.get("fallback") else ""
+        return (
+            f"天气为{condition}，气温 {weather['temperature_2m']:.1f}℃，"
+            f"湿度 {weather['relative_humidity_2m']:.0f}%，"
+            f"风速 {weather['wind_speed_10m']:.1f} km/h{fallback_note}"
+        )
+
+    @staticmethod
     def _build_reasons(
         score: float,
         weather: dict[str, Any],
         vehicle: dict[str, Any],
         road: dict[str, Any],
+        segment: dict[str, Any],
+        now: datetime,
     ) -> list[str]:
-        reasons: list[str] = []
-        if vehicle["vehicle_count"] >= 10:
-            reasons.append("YOLO 检测车辆较多")
-        if vehicle.get("avg_speed_kmh") is not None and vehicle["avg_speed_kmh"] < 20:
-            reasons.append("车辆平均速度偏低")
-        if weather["rain"] > 0 or weather["precipitation"] > 0:
-            reasons.append("当前存在降雨")
-        if weather["snowfall"] > 0:
-            reasons.append("当前存在降雪")
-        if weather["wind_speed_10m"] >= 25:
-            reasons.append("风速较高")
-        if vehicle["active_incidents"] > 0:
-            reasons.append("摄像头存在活动异常事件")
-        if road.get("road_type") in {"motorway", "trunk", "primary", "main"}:
-            reasons.append("主干道路交通暴露度较高")
-        if not reasons:
-            reasons.append("当前天气与车辆状态平稳")
-        reasons.append(f"模型预测风险 {score * 100:.1f}%")
-        return reasons
+        date_context = LiveRiskPredictionService._date_context(now)
+        baseline = int(vehicle["historical_baseline_count"])
+        window_count = int(vehicle["window_vehicle_count"])
+        flow_source_note = (
+            "基于 YOLO 轨迹窗口统计"
+            if vehicle["source"] == "yolo-window"
+            else "当前观测不足 1 分钟，暂采用道路历史基线估算"
+        )
+        maxspeed = road.get("maxspeed") or segment.get("speed_limit") or "未知"
+        lanes = road.get("lanes") or segment.get("lane_count") or "未知"
+        surface = road.get("surface") or "路面信息未知"
+        historical_accidents = int(segment.get("historical_accidents_7d") or 0)
+        return [
+            (
+                f"日期：今天是 {date_context['date']} {date_context['weekday']}，"
+                f"属于{'周末' if date_context['is_weekend'] else '工作日'}的{date_context['period']}时段"
+            ),
+            (
+                f"累计车流：近 {PREDICTION_WINDOW_MINUTES} 分钟约 {window_count} 辆，"
+                f"相较历史同星期同时段基线 {baseline} 辆{vehicle['flow_comparison']} "
+                f"{abs(float(vehicle['flow_change_percent'])):.1f}%（{flow_source_note}）"
+            ),
+            (
+                f"窗口速度：近 {PREDICTION_WINDOW_MINUTES} 分钟车辆加权平均速度 "
+                f"{float(vehicle['avg_speed_kmh']):.1f} km/h，路段限速 {maxspeed} km/h"
+            ),
+            f"天气：{LiveRiskPredictionService._weather_text(weather)}",
+            (
+                f"道路条件：{road.get('road_type') or segment.get('road_type') or 'unknown'} 类型道路，"
+                f"{lanes} 车道，路面 {surface}"
+            ),
+            f"历史事故：近 7 天记录 {historical_accidents} 起（无记录时按 0 起输入模型）",
+            f"综合上述日期、累计车流、窗口速度、天气、道路和历史事故因素，模型预测风险 {score * 100:.1f}%",
+        ]
 
 
 live_risk_prediction_service = LiveRiskPredictionService()

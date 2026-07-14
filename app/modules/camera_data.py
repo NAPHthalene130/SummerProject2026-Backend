@@ -1,8 +1,12 @@
 import threading
+import time
+from collections import deque
 from typing import Optional
 
 
 CONSECUTIVE_NORMAL_THRESHOLD = 10
+PREDICTION_HISTORY_SECONDS = 30 * 60
+PREDICTION_SAMPLE_INTERVAL_SECONDS = 5
 
 
 class BoundingBoxItem:
@@ -87,6 +91,11 @@ class CameraDataStore:
                     cls._instance._data: dict[str, CameraData] = {}
                     cls._instance._incident_data: dict[str, TrafficIncidentResult] = {}
                     cls._instance._traffic_metrics: dict[str, dict[str, float]] = {}
+                    cls._instance._prediction_tracks: dict[str, dict[int, float]] = {}
+                    cls._instance._prediction_speed_samples: dict[
+                        str, deque[tuple[float, float, int]]
+                    ] = {}
+                    cls._instance._last_prediction_sample: dict[str, float] = {}
                     cls._instance._active_incidents: dict[str, set[str]] = {}
                     cls._instance._consecutive_normal_count: dict[str, int] = {}
                     # 车道数缓存：由 LaneSegmentationWorker 每 5s 更新，inference.py 优先读取此缓存
@@ -120,6 +129,15 @@ class CameraDataStore:
             moto_count=moto_count,
             avg_headway=avg_headway,
         )
+        now = time.time()
+        tracks = self._prediction_tracks.setdefault(camera_id, {})
+        for box in boxes:
+            if box.track_id >= 0:
+                tracks[box.track_id] = now
+        cutoff = now - PREDICTION_HISTORY_SECONDS
+        stale_track_ids = [track_id for track_id, seen_at in tracks.items() if seen_at < cutoff]
+        for track_id in stale_track_ids:
+            tracks.pop(track_id, None)
 
     def get_by_camera_id(self, camera_id: str) -> Optional[CameraData]:
         return self._data.get(camera_id)
@@ -138,6 +156,16 @@ class CameraDataStore:
             "avg_speed_kmh": float(avg_speed_kmh),
             "vehicle_count": float(vehicle_count),
         }
+        now = time.time()
+        last_sample = self._last_prediction_sample.get(camera_id, 0.0)
+        if now - last_sample < PREDICTION_SAMPLE_INTERVAL_SECONDS:
+            return
+        samples = self._prediction_speed_samples.setdefault(camera_id, deque())
+        samples.append((now, float(avg_speed_kmh), int(vehicle_count)))
+        cutoff = now - PREDICTION_HISTORY_SECONDS
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+        self._last_prediction_sample[camera_id] = now
 
     def get_traffic_metrics(self, camera_id: str) -> Optional[dict[str, float]]:
         metrics = self._traffic_metrics.get(camera_id)
@@ -150,6 +178,40 @@ class CameraDataStore:
     def get_lane_count(self, camera_id: str) -> Optional[int]:
         """inference.py 优先读取此缓存；为 None 时回退到 _estimate_lanes() 启发式。"""
         return self._lane_count_cache.get(camera_id)
+
+    def get_prediction_window_metrics(
+        self,
+        camera_id: str,
+        window_seconds: int = 15 * 60,
+        *,
+        now: Optional[float] = None,
+    ) -> dict[str, float | int | None]:
+        """Return prediction-only aggregates without changing realtime metrics."""
+        current_time = time.time() if now is None else now
+        cutoff = current_time - window_seconds
+        tracks = self._prediction_tracks.get(camera_id, {})
+        track_times = [seen_at for seen_at in tracks.values() if seen_at >= cutoff]
+        samples = [
+            sample
+            for sample in self._prediction_speed_samples.get(camera_id, ())
+            if sample[0] >= cutoff
+        ]
+
+        weighted_samples = [sample for sample in samples if sample[1] > 0 and sample[2] > 0]
+        speed_weight = sum(sample[2] for sample in weighted_samples)
+        avg_speed = (
+            sum(sample[1] * sample[2] for sample in weighted_samples) / speed_weight
+            if speed_weight > 0
+            else None
+        )
+        timestamps = track_times + [sample[0] for sample in samples]
+        observed_seconds = current_time - min(timestamps) if timestamps else 0.0
+        return {
+            "cumulative_vehicle_count": len(track_times),
+            "avg_speed_kmh": float(avg_speed) if avg_speed is not None else None,
+            "sample_count": len(samples),
+            "observed_seconds": min(float(window_seconds), max(0.0, observed_seconds)),
+        }
 
     def update_incident_result(self, camera_id: str, result: TrafficIncidentResult) -> None:
         self._incident_data[camera_id] = result
