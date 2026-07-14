@@ -14,6 +14,7 @@ from ultralytics import YOLO
 from app.config import settings
 from app.modules.camera_data import BoundingBoxItem, CameraDataStore
 from app.modules.lstm.predictor import risk_predictor
+from app.modules.yolo.inference import FrameProcessor
 
 LOST_BUFFER = 30
 TRAIL_MAX_AGE = 30
@@ -101,13 +102,8 @@ class BatchDetector:
         self._pending_event = threading.Event()
         self._stop_event = threading.Event()
 
-        self.trackers: dict[str, sv.ByteTrack] = {}
-        self.trails: dict[str, dict[int, list[tuple[float, float]]]] = {}
-        self.trail_age: dict[str, dict[int, int]] = {}
-        self.frame_counts: dict[str, int] = {}
-
-        self.box_annotator = sv.BoxAnnotator()
-        self.label_annotator = sv.LabelAnnotator()
+        # FrameProcessor per-camera state (replaces dev2's trackers/trails/etc.)
+        self._processors: dict[str, FrameProcessor] = {}
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -118,11 +114,6 @@ class BatchDetector:
         self._lifetime_total = 0
         self._last_fps = time.perf_counter()
         self._metrics_lock = threading.Lock()
-
-        self._prev_pos: dict[str, dict[int, dict]] = {}
-        self._prev_vel: dict[str, dict[int, float]] = {}
-        self._prev_ts: dict[str, int] = {}
-        self.PIXEL_TO_METER = 0.05
 
     def register_stream(self, cam_id, stream):
         with self._streams_lock:
@@ -336,13 +327,7 @@ class BatchDetector:
             self._pending_event.set()
 
     def _clear_camera_state(self, cam_id: str) -> None:
-        self.trackers.pop(cam_id, None)
-        self.trails.pop(cam_id, None)
-        self.trail_age.pop(cam_id, None)
-        self.frame_counts.pop(cam_id, None)
-        self._prev_pos.pop(cam_id, None)
-        self._prev_vel.pop(cam_id, None)
-        self._prev_ts.pop(cam_id, None)
+        self._processors.pop(cam_id, None)
 
     def _record_processed_frame(self) -> None:
         now = time.perf_counter()
@@ -385,83 +370,52 @@ class BatchDetector:
 
     def _process_single(self, cam_id: str, pending: PendingFrame, result) -> None:
         frame = pending.frame.copy()
-        if cam_id not in self.trackers:
-            self.trackers[cam_id] = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
-            self.trails[cam_id] = {}
-            self.frame_counts[cam_id] = 0
 
-        self.frame_counts[cam_id] += 1
-        detections = sv.Detections.from_ultralytics(result)
+        # Get or create FrameProcessor for this camera
+        if cam_id not in self._processors:
+            fp = FrameProcessor(cam_id, self.class_names)
+            h, w = frame.shape[:2]
+            fp.init_zone(h, w)
+            self._processors[cam_id] = fp
+        fp = self._processors[cam_id]
 
-        if len(detections) > 0:
-            detections = self.trackers[cam_id].update_with_detections(detections)
-        else:
-            detections.tracker_id = np.array([], dtype=int)
+        # Use FrameProcessor for tracking, speed calculation, and supervision unified drawing
+        dlist, annotated, stats = fp.process(self.model, frame, self.device, result)
 
-        labels: list[str] = []
-        det_list: list[dict] = []
-        for i in range(len(detections)):
-            track_id = int(detections.tracker_id[i]) if detections.tracker_id is not None and i < len(detections.tracker_id) else -1
-            class_id = int(detections.class_id[i]) if detections.class_id is not None else -1
-            class_name = self.class_names.get(class_id, f"cls_{class_id}")
-            conf = float(detections.confidence[i]) if detections.confidence is not None else 0.0
-            xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else [0,0,0,0]
-            labels.append(f"#{track_id} {class_name} {conf:.2f}")
-            cx, cy = (xyxy[0]+xyxy[2])/2, (xyxy[1]+xyxy[3])/2
-            self.trails[cam_id].setdefault(track_id, []).append((cx, cy))
-            if len(self.trails[cam_id][track_id]) > 30:
-                self.trails[cam_id][track_id].pop(0)
-            self.trail_age.setdefault(cam_id, {})[track_id] = self.frame_counts[cam_id]
-            det_list.append({
-                "track_id": track_id, "class_name": class_name,
-                "confidence": conf, "bbox": xyxy,
-            })
-
-        CameraDataStore().update(
-            camera_id=cam_id, total_vehicle_count=len(det_list),
-            boxes=[BoundingBoxItem(int(d["track_id"]), str(d["class_name"]),
-                                  float(d["confidence"]), list(d["bbox"])) for d in det_list],
-        )
-
+        # Build enriched list for LSTM (field names must stay unchanged)
         ts = int(time.time() * 1000)
-        prev = self._prev_ts.get(cam_id, ts - 33)
-        self._prev_ts[cam_id] = ts
-        dt = max((ts - prev) / 1000.0, 0.001)
-
-        self._prev_pos.setdefault(cam_id, {})
-        self._prev_vel.setdefault(cam_id, {})
-        cur_pos: dict[int, dict] = {}
         enriched: list[dict] = []
-
-        for det in det_list:
-            tid = int(det.get("track_id", -1))
-            if tid < 0:
-                continue
-            bb = det.get("bbox", [0,0,0,0])
-            cx, cy = (bb[0]+bb[2])/2, (bb[1]+bb[3])/2
-            cur_pos[tid] = {"cx": cx, "cy": cy}
-            p = self._prev_pos[cam_id].get(tid)
-            vel = ((np.hypot(cx-p["cx"], cy-p["cy"]) * self.PIXEL_TO_METER) / dt if p else 0.0)
-            pv = self._prev_vel[cam_id].get(tid, vel)
-            acc = (vel - pv) / dt
-            sec = 1 if p and cx < p["cx"] else 0
-            prec, hw = -1, 0.0
-            for oid, o in cur_pos.items():
-                if oid == tid:
-                    continue
-                dy = cy - o["cy"]
-                if dy > 0 and (hw == 0 or abs(dy) < hw):
-                    hw, prec = abs(dy), oid
+        for d in dlist:
+            tid = d["track_id"]
+            b = d["bbox"]
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            prev = fp._prev_positions.get(tid, {})
+            vel_mps = prev.get("_vel_mps", 0.0)
+            # space_headway: find nearest vehicle ahead (same y direction)
+            hw = 0.0
+            prec = -1
+            if len(dlist) > 1:
+                for od in dlist:
+                    if od["track_id"] == tid:
+                        continue
+                    ob = od["bbox"]
+                    ocy = (ob[1] + ob[3]) / 2
+                    dy = cy - ocy
+                    if dy > 0 and (hw == 0.0 or abs(dy) < hw):
+                        hw = abs(dy)
+                        prec = od["track_id"]
             enriched.append({
-                "track_id": tid, "class_name": det.get("class_name", ""),
-                "confidence": det.get("confidence", 0.0), "bbox": bb,
-                "velocity": vel, "acceleration": acc, "section_id": sec,
-                "preceding_id": prec, "space_headway": hw * self.PIXEL_TO_METER,
+                "track_id": tid,
+                "frame_id": fp.frame_count,
+                "timestamp_ms": ts,
+                "section_id": 1 if prev.get("cx", cx) > cx else 0,
+                "velocity": vel_mps,
+                "acceleration": 0.0,
+                "preceding_id": prec,
+                "space_headway": hw * 0.05,
             })
-            self._prev_vel[cam_id][tid] = vel
 
-        self._prev_pos[cam_id] = cur_pos
-
+        # Update traffic metrics for risk prediction service
         if enriched:
             moving_speeds = [float(item["velocity"]) * 3.6 for item in enriched if float(item["velocity"]) > 0]
             avg_speed_kmh = float(np.mean(moving_speeds)) if moving_speeds else 0.0
@@ -471,33 +425,28 @@ class BatchDetector:
                 vehicle_count=len(enriched),
             )
 
+        # Feed enriched data to LSTM risk predictor
         if enriched:
             try:
-                risk_predictor.process_frame(cam_id, self.frame_counts[cam_id], ts, enriched)
+                risk_predictor.process_frame(cam_id, fp.frame_count, ts, enriched)
             except Exception:
                 pass
 
-        frame = self.box_annotator.annotate(scene=frame, detections=detections)
-        frame = self.label_annotator.annotate(scene=frame, detections=detections, labels=labels)
-
-        cf = self.frame_counts[cam_id]
-        stale = [t for t in list(self.trails[cam_id]) if cf - self.trail_age.get(cam_id, {}).get(t, 0) > TRAIL_MAX_AGE]
-        for t in stale:
-            del self.trails[cam_id][t]
-            self.trail_age.get(cam_id, {}).pop(t, None)
-        for t in self.trails[cam_id]:
-            tr = self.trails[cam_id][t]
-            if len(tr) < 2:
-                continue
-            for j in range(1, len(tr)):
-                cv2.line(frame, (int(tr[j-1][0]), int(tr[j-1][1])),
-                         (int(tr[j][0]), int(tr[j][1])), (0, 255, 255), 1)
-
+        # Push annotated frame to stream (preserve dev2's frame_id/captured_at signature)
         with self._streams_lock:
             s = self._streams.get(cam_id)
         if s is not None:
             s.set_processed_frame(
-                frame,
+                annotated,
                 frame_id=pending.frame_id,
                 captured_at=pending.captured_at,
             )
+
+    def get_traffic_flow(self, cam_id: str) -> dict:
+        fp = self._processors.get(cam_id)
+        if fp is None:
+            return {"entry_count": 0, "exit_count": 0, "flow_per_min": 0.0}
+        return fp.get_traffic_flow()
+
+    def get_all_traffic_flow(self) -> dict[str, dict]:
+        return {cid: self.get_traffic_flow(cid) for cid in self._processors}
