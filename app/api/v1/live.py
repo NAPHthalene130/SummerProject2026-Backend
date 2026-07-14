@@ -11,7 +11,7 @@ from app.modules.stream import ProcessedVideoTrack, StreamManager
 logger = logging.getLogger(__name__)
 
 live_router = APIRouter()
-DISCONNECT_GRACE_SECONDS = 8.0
+DISCONNECT_GRACE_SECONDS = 2.0
 CONNECT_TIMEOUT_SECONDS = 30.0
 NEGOTIATION_TIMEOUT_SECONDS = 20.0
 
