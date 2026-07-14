@@ -82,7 +82,7 @@ async def stream_all_boxes():
             except Exception:
                 pass
             yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)  # 50ms = 20fps，减少检测框延迟
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
