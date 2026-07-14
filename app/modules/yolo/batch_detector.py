@@ -349,6 +349,28 @@ class BatchDetector:
     def _clear_camera_state(self, cam_id: str) -> None:
         self._processors.pop(cam_id, None)
 
+    def _build_bev_matrix(self, cam_id: str):
+        """从 settings.BEV_CALIBRATION 读取该路标定点，计算 3x3 透视矩阵。
+        返回 float32 矩阵；未标定或标定非法时返回 None（FrameProcessor 回退到 _calc_speed_legacy）。"""
+        calib = settings.BEV_CALIBRATION.get(cam_id)
+        if not calib:
+            return None
+        try:
+            src = np.array(calib["src"], dtype=np.float32)
+            dst = np.array(calib["dst"], dtype=np.float32)
+            if src.shape != (4, 2) or dst.shape != (4, 2):
+                logger.warning(
+                    "BEV calib for %s invalid shape src=%s dst=%s, fallback to legacy",
+                    cam_id, src.shape, dst.shape,
+                )
+                return None
+            matrix = cv2.getPerspectiveTransform(src, dst)
+            logger.info("BEV matrix loaded for %s", cam_id)
+            return matrix
+        except Exception:
+            logger.warning("BEV calib parse failed for %s, fallback to legacy", cam_id, exc_info=True)
+            return None
+
     def _record_processed_frame(self) -> None:
         now = time.perf_counter()
         with self._metrics_lock:
@@ -401,7 +423,8 @@ class BatchDetector:
 
         # Get or create FrameProcessor for this camera
         if cam_id not in self._processors:
-            fp = FrameProcessor(cam_id, self.class_names)
+            bev_matrix = self._build_bev_matrix(cam_id)
+            fp = FrameProcessor(cam_id, self.class_names, bev_matrix=bev_matrix)
             h, w = frame.shape[:2]
             fp.init_zone(h, w)
             self._processors[cam_id] = fp
