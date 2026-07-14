@@ -1,15 +1,32 @@
+import asyncio
+import json
 import logging
+import re
 from typing import Any, AsyncIterator, Optional
 
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent
-from langchain.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph.state import CompiledStateGraph
 
 from app.config import llm_settings
 from app.modules.agent.base import BaseAgent
 from app.modules.agent.tool import (
+    answer_general_question,
+    batch_dispatch_unassigned,
+    dispatch_work_order,
+    dispatch_work_order_range,
+    get_work_order_detail,
+    query_staff,
+    query_work_order_stats,
+    query_work_orders,
+    search_work_orders,
+    suggest_handling,
+)
+
+logger = logging.getLogger(__name__)
+
+MAX_REACT_TURNS = 10
+
+TOOLS = [
     query_work_orders,
     get_work_order_detail,
     search_work_orders,
@@ -20,11 +37,37 @@ from app.modules.agent.tool import (
     batch_dispatch_unassigned,
     dispatch_work_order_range,
     answer_general_question,
-)
+]
 
-logger = logging.getLogger(__name__)
+TOOL_NAMES = [t.__name__ for t in TOOLS]
+TOOL_BY_NAME = {t.__name__: t for t in TOOLS}
 
-SYSTEM_PROMPT = """你是智能交通指挥Agent。当用户发出指令时,你必须**优先执行操作**,不要先输出分析报告。
+TOOL_DESCRIPTIONS = {
+    "query_work_orders": "查询工单列表,参数: user_id(可选,int), status(可选,str), level(可选,str), limit(可选,int), offset(可选,int)",
+    "get_work_order_detail": "获取工单详情,参数: work_order_id(str)",
+    "search_work_orders": "搜索工单,参数: keyword(str)",
+    "query_staff": "查询可派发人员列表,无必需参数",
+    "query_work_order_stats": "查询工单统计概况,无必需参数",
+    "suggest_handling": "分析工单并生成处置建议,参数: work_order_id(str)",
+    "dispatch_work_order": "派发单个工单,参数: work_order_id(str), user_id(int)",
+    "batch_dispatch_unassigned": "批量派发所有未派发工单,无必需参数",
+    "dispatch_work_order_range": "区间派发工单,参数: start_id(int), end_id(int)",
+    "answer_general_question": "检索交通法规回答通用问题,参数: question(str)",
+}
+
+SYSTEM_PROMPT = """你是智能交通指挥Agent。当用户发出指令时,你必须**优先执行操作**,直接调用工具,不要先输出分析报告。
+
+## 可用工具
+{tool_list}
+
+## 工具调用格式
+当你需要调用工具时,严格按以下JSON格式输出(不要加任何其他文字):
+
+<tool_call>
+{{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}
+</tool_call>
+
+工具执行后你会收到结果,然后可以继续调用其他工具或给出最终回答。
 
 ## 执行规则 (最高优先级)
 1. 用户说"派发"(单条,如"派发工单335") → 调用 dispatch_work_order。若用户未指定人员,必须先调用 query_staff 获取同类别(work_order_count最小)的人员ID,再调用 dispatch_work_order,严禁编造 user_id;若用户指定了人员名,也先 query_staff 取其 user_id
@@ -43,8 +86,8 @@ SYSTEM_PROMPT = """你是智能交通指挥Agent。当用户发出指令时,你�
 - 查询类: "工单xxx,类型[xxx],等级[xxx],状态[xxx],负责人[xxx]。"
 - 建议类: "该工单为[等级]的[类型],当前[状态]。建议:1.xxx 2.xxx 3.xxx"
 - 统计类: "当前共N单,未解决M单(高优K单),人员平均负载X单。"
-- 批量/区间类: 严格遵循工具返回的 presentation_hint,用1行汇总,例如"区间300~330内共派发28单,跳过0单,失败0单。";不要逐条罗列明细,不要输出表格
-- 严禁输出Markdown表格;严禁出现"结论""依据""未核验项"等结构化小标题(无论是否带##);严禁输出内部JSON键名
+- 批量/区间类: 严格遵循工具返回的 presentation_hint,用1行汇总;不要逐条罗列明细,不要输出表格
+- 严禁输出Markdown表格;严禁出现"结论""依据""未核验项"等结构化小标题;严禁输出内部JSON键名
 
 ## 字段翻译(内部JSON→用户输出)
 work_order_stage→工单状态:unassigned→未派发 pending→待处理 processing→处理中 completed→已完成 ignored→已忽略
@@ -56,26 +99,84 @@ work_order_count→负载, camera_name→点位, assignee→负责人, distance_
 ## 派发规则
 - 用户说"派发"即视为授权,直接调用 dispatch_work_order
 - 类别不匹配时,先尝试派发,工具会返回错误;将错误原样告知用户
-- 批量派发时逐条执行,每条汇报结果"""
+- 批量派发时调用一次 batch_dispatch_unassigned"""
 
-TOOLS = [
-    query_work_orders,
-    get_work_order_detail,
-    search_work_orders,
-    query_staff,
-    query_work_order_stats,
-    suggest_handling,
-    dispatch_work_order,
-    batch_dispatch_unassigned,
-    dispatch_work_order_range,
-    answer_general_question,
-]
 
-TOOL_NAMES = [t.__name__ for t in TOOLS]
+def _build_tool_list_text() -> str:
+    lines: list[str] = []
+    for name, desc in TOOL_DESCRIPTIONS.items():
+        lines.append(f"- {name}: {desc}")
+    return "\n".join(lines)
+
+
+def _parse_tool_call(text: str) -> Optional[dict[str, Any]]:
+    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse tool call JSON: %s", m.group(1)[:200])
+        return None
+
+
+async def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
+    tool = TOOL_BY_NAME.get(name)
+    if tool is None:
+        return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
+    try:
+        result = await asyncio.to_thread(tool, **arguments)
+    except Exception as exc:
+        logger.exception("Tool %s execution failed", name)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _truncate_tool_result(result: str, max_chars: int = 3000) -> str:
+    if len(result) <= max_chars:
+        return result
+    return result[:max_chars] + "\n…[结果过长已截断]"
+
+
+class ReActConversation:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, str]] = []
+
+    def add_user(self, content: str) -> None:
+        self.messages.append({"role": "user", "content": content})
+
+    def add_assistant(self, content: str) -> None:
+        self.messages.append({"role": "assistant", "content": content})
+
+    def add_tool_result(self, content: str) -> None:
+        self.messages.append({"role": "tool", "content": content})
+
+    def build_prompt(self) -> str:
+        tool_list = _build_tool_list_text()
+        header = SYSTEM_PROMPT.format(tool_list=tool_list) + "\n\n## 对话历史\n"
+        parts: list[str] = [header]
+        for msg in self.messages[-20:]:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user":
+                parts.append(f"用户: {content}")
+            elif role == "assistant":
+                parts.append(f"助手: {content}")
+            elif role == "tool":
+                parts.append(f"工具返回: {content}")
+        parts.append("助手: ")
+        return "\n\n".join(parts)
+
+    def trim(self, keep: int = 20) -> None:
+        if len(self.messages) > keep:
+            self.messages = self.messages[-keep:]
 
 
 class Agent(BaseAgent):
-    """智能交通指挥Agent,基于LangChain 1.x构建。"""
+    """智能交通指挥Agent,基于ReAct模式,不依赖原生function calling。"""
 
     _instance: Optional["Agent"] = None
 
@@ -91,12 +192,10 @@ class Agent(BaseAgent):
         self._initialized = True
 
         self._llm: Optional[ChatOpenAI] = None
-        self._graph: Optional[CompiledStateGraph] = None
-        self._memory: Optional[MemorySaver] = None
+        self._sessions: dict[str, ReActConversation] = {}
 
         self._init_llm()
-        self._init_agent()
-        logger.info("SmartDispatchAgent 初始化完成(单例)")
+        logger.info("SmartDispatchAgent(ReAct) 初始化完成")
 
     def _init_llm(self) -> None:
         self._llm = ChatOpenAI(
@@ -105,129 +204,156 @@ class Agent(BaseAgent):
             model=llm_settings.model_name,
             temperature=0.1,
             max_tokens=2048,
-            timeout=30,
+            timeout=60,
             max_retries=2,
         )
 
-    def _init_agent(self) -> None:
-        self._memory = MemorySaver()
-        self._graph = create_agent(
-            model=self._llm,
-            tools=TOOLS,
-            system_prompt=SYSTEM_PROMPT,
-            checkpointer=self._memory,
-        )
-
-    def _build_config(self, thread_id: str = "default") -> dict[str, Any]:
-        return {"configurable": {"thread_id": thread_id}}
+    def _get_conversation(self, thread_id: str) -> ReActConversation:
+        if thread_id not in self._sessions:
+            self._sessions[thread_id] = ReActConversation()
+        return self._sessions[thread_id]
 
     async def chat(self, user_message: str, thread_id: str = "default") -> str:
-        if not self._graph:
+        if not self._llm:
             return "Agent 未初始化,请检查 LLM 配置。"
 
+        conv = self._get_conversation(thread_id)
+        conv.add_user(user_message)
+
         try:
-            result = await self._graph.ainvoke(
-                {"messages": [HumanMessage(content=user_message)]},
-                config=self._build_config(thread_id),
-            )
-            messages: list[Any] = result.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                return str(last_msg.content)
-            return "Agent 未返回有效结果。"
+            for turn in range(MAX_REACT_TURNS):
+                prompt = conv.build_prompt()
+                response = await self._llm.ainvoke([HumanMessage(content=prompt)])
+                text = str(response.content).strip() if response.content else ""
+
+                if not text:
+                    return "Agent 未返回有效结果。"
+
+                tool_call = _parse_tool_call(text)
+                if tool_call:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("arguments", {})
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    clean_args = {}
+                    if isinstance(tool_args, dict):
+                        for k, v in tool_args.items():
+                            clean_args[str(k)] = v
+
+                    logger.info("ReAct turn %d: calling %s with %s", turn + 1, tool_name, str(clean_args)[:200])
+                    conv.add_assistant(text)
+                    result = await _execute_tool(tool_name, clean_args)
+                    result = _truncate_tool_result(result)
+                    conv.add_tool_result(result)
+                else:
+                    conv.add_assistant(text)
+                    conv.trim(keep=30)
+                    return text
+
+            return "Agent 处理达到最大轮次限制,请简化问题后重试。"
         except Exception as exc:
             logger.exception("Agent对话异常")
             raise RuntimeError("Agent 对话执行失败,请检查模型服务与工具连接。") from exc
 
     def chat_sync(self, user_message: str, thread_id: str = "default") -> str:
-        if not self._graph:
+        if not self._llm:
             return "Agent 未初始化,请检查 LLM 配置。"
 
+        conv = self._get_conversation(thread_id)
+        conv.add_user(user_message)
+
         try:
-            result = self._graph.invoke(
-                {"messages": [HumanMessage(content=user_message)]},
-                config=self._build_config(thread_id),
-            )
-            messages: list[Any] = result.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                return str(last_msg.content)
-            return "Agent 未返回有效结果。"
+            for turn in range(MAX_REACT_TURNS):
+                prompt = conv.build_prompt()
+                response = self._llm.invoke([HumanMessage(content=prompt)])
+                text = str(response.content).strip() if response.content else ""
+
+                if not text:
+                    return "Agent 未返回有效结果。"
+
+                tool_call = _parse_tool_call(text)
+                if tool_call:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("arguments", {})
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    clean_args = {}
+                    if isinstance(tool_args, dict):
+                        for k, v in tool_args.items():
+                            clean_args[str(k)] = v
+
+                    logger.info("ReAct sync turn %d: calling %s", turn + 1, tool_name)
+                    conv.add_assistant(text)
+                    result = _execute_tool_sync(tool_name, clean_args)
+                    result = _truncate_tool_result(result)
+                    conv.add_tool_result(result)
+                else:
+                    conv.add_assistant(text)
+                    conv.trim(keep=30)
+                    return text
+
+            return "Agent 处理达到最大轮次限制,请简化问题后重试。"
         except Exception as exc:
             logger.exception("Agent同步对话异常")
             raise RuntimeError("Agent 对话执行失败,请检查模型服务与工具连接。") from exc
 
     async def astream(self, user_message: str, thread_id: str = "default") -> AsyncIterator[dict[str, Any]]:
-        """异步流式输出,逐个产出事件字典。
-
-        事件类型:
-        - {"type": "tool_start", "name": 工具名}
-        - {"type": "tool_end", "name": 工具名, "preview": 结果摘要}
-        - {"type": "token", "content": 文本片段}
-        - {"type": "error", "content": 错误信息}
-        """
-        if not self._graph:
+        if not self._llm:
             yield {"type": "error", "content": "Agent 未初始化,请检查 LLM 配置。"}
             return
 
-        config = self._build_config(thread_id)
-        try:
-            async for event in self._graph.astream_events(
-                {"messages": [HumanMessage(content=user_message)]},
-                config=config,
-                version="v2",
-            ):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data") or {}
+        conv = self._get_conversation(thread_id)
+        conv.add_user(user_message)
 
-                if kind == "on_tool_start":
-                    yield {"type": "tool_start", "name": name}
-                elif kind == "on_tool_end":
-                    yield {
-                        "type": "tool_end",
-                        "name": name,
-                        "preview": self._extract_tool_preview(data.get("output")),
-                    }
-                elif kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    content = getattr(chunk, "content", "")
-                    if isinstance(content, str) and content:
-                        yield {"type": "token", "content": content}
+        try:
+            for turn in range(MAX_REACT_TURNS):
+                prompt = conv.build_prompt()
+                response = await self._llm.ainvoke([HumanMessage(content=prompt)])
+                text = str(response.content).strip() if response.content else ""
+
+                if not text:
+                    yield {"type": "error", "content": "Agent 未返回有效结果。"}
+                    return
+
+                tool_call = _parse_tool_call(text)
+                if tool_call:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("arguments", {})
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    clean_args = {}
+                    if isinstance(tool_args, dict):
+                        for k, v in tool_args.items():
+                            clean_args[str(k)] = v
+
+                    yield {"type": "tool_start", "name": tool_name}
+                    conv.add_assistant(text)
+                    result = await _execute_tool(tool_name, clean_args)
+                    preview = result[:200] + "…" if len(result) > 200 else result
+                    yield {"type": "tool_end", "name": tool_name, "preview": preview}
+                    result = _truncate_tool_result(result)
+                    conv.add_tool_result(result)
+                else:
+                    conv.add_assistant(text)
+                    conv.trim(keep=30)
+                    for i in range(0, len(text), 20):
+                        yield {"type": "token", "content": text[i:i + 20]}
+                    return
+
+            yield {"type": "error", "content": "Agent 处理达到最大轮次限制"}
         except Exception:
             logger.exception("Agent流式对话异常")
-            yield {
-                "type": "error",
-                "content": "Agent 对话执行失败,请检查模型服务与工具连接。",
-            }
-
-    @staticmethod
-    def _extract_tool_preview(output: Any) -> str:
-        if output is None:
-            return ""
-        text = getattr(output, "content", output)
-        if not isinstance(text, str):
-            text = str(text)
-        text = text.strip()
-        if len(text) > 200:
-            return text[:200] + "…"
-        return text
+            yield {"type": "error", "content": "Agent 对话执行失败,请检查模型服务与工具连接。"}
 
     def clear_memory(self, thread_id: str = "default") -> None:
-        if not self._memory or not thread_id:
-            return
-        try:
-            self._memory.delete_thread(thread_id)
-            logger.info("Agent 对话记忆已清除: thread_id=%s", thread_id)
-        except Exception:
-            logger.exception("清除对话记忆失败: thread_id=%s", thread_id)
+        self._sessions.pop(thread_id, None)
+        logger.info("Agent 对话记忆已清除: thread_id=%s", thread_id)
 
     @property
     def tools(self) -> list[str]:
         return TOOL_NAMES
 
     def probe(self) -> dict[str, Any]:
-        """轻量探活:对模型服务发起一次极小请求,验证连通性。"""
         if llm_settings.api_key in {"", "your_api_key_here"}:
             return {
                 "ok": False,
@@ -237,7 +363,22 @@ class Agent(BaseAgent):
         if not self._llm:
             return {"ok": False, "detail": "LLM 未初始化"}
         try:
-            self._llm.invoke("ping", config={"tags": ["health-probe"]})
+            self._llm.invoke("ping")
             return {"ok": True, "model": llm_settings.model_name}
         except Exception as exc:
             return {"ok": False, "model": llm_settings.model_name, "detail": str(exc)}
+
+
+def _execute_tool_sync(name: str, arguments: dict[str, Any]) -> str:
+    tool = TOOL_BY_NAME.get(name)
+    if tool is None:
+        return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
+    try:
+        result = tool(**arguments)
+    except Exception as exc:
+        logger.exception("Tool %s sync execution failed", name)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False, default=str)
