@@ -111,8 +111,28 @@ async def lifespan(application: FastAPI):
     else:
         logger.info("TrafficAnalyst disabled by configuration or missing API key")
 
+    # Lane segmentation worker (optional): 5s serial inference for lane count.
+    # Only starts when enabled and model_path points to a valid file.
+    lane_seg_worker = None
+    if settings.LANE_SEG_ENABLED and settings.LANE_SEG_MODEL_PATH:
+        try:
+            from app.modules.yolo.lane_segmentation import LaneSegmentationWorker
+            lane_seg_worker = LaneSegmentationWorker(
+                model_path=settings.LANE_SEG_MODEL_PATH,
+                interval=settings.LANE_SEG_INTERVAL,
+                image_size=settings.LANE_SEG_IMAGE_SIZE,
+            )
+            lane_seg_worker.start()
+        except Exception as e:
+            logger.warning("LaneSegmentationWorker init failed: %s", e)
+            lane_seg_worker = None
+    else:
+        logger.info("LaneSegmentationWorker disabled (lane_segmentation.enabled=false or model_path empty)")
+
     yield
 
+    if lane_seg_worker is not None:
+        lane_seg_worker.stop()
     if traffic_analyst_enabled:
         await TrafficAnalyst().stop()
     await close_all_peer_connections()
