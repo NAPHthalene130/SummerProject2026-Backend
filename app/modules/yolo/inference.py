@@ -387,8 +387,10 @@ class FrameProcessor:
         scale = self._perspective_scale(avg_cy)
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
-        if new_kmh < 1.0:
-            new_kmh = 0.0
+        if new_kmh < 2.0:
+            new_kmh = 0.0      # <2km/h 视为静止（停车/噪声）
+        elif new_kmh < 20.0:
+            new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
         # EMA 平滑（避免抖动）
         if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
@@ -430,8 +432,10 @@ class FrameProcessor:
         new_kmh = speed_ms * 3.6
 
         # 与 legacy 保持一致的低速归零 + EMA 平滑，便于两种方法行为对齐
-        if new_kmh < 1.0:
-            new_kmh = 0.0
+        if new_kmh < 2.0:
+            new_kmh = 0.0      # <2km/h 视为静止（停车/噪声）
+        elif new_kmh < 20.0:
+            new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
         if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
 
