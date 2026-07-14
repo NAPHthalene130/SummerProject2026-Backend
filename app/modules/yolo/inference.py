@@ -75,6 +75,9 @@ class FrameProcessor:
         self._floor_kmh_cache: dict[int, float] = {}
         # 每 track 最后一次"有移动"的时间戳，用于 2s 不动才归零判断
         self._last_moved_time: dict[int, float] = {}
+        # 消失点 y 坐标（None=未估计）。用于非线性透视 scale，替代线性 _perspective_scale
+        self._vp_y: Optional[float] = None
+        self._vp_estimate_counter: int = 0
         self._track_colors: dict[int, sv.Color] = {}
         self._lane_history: list[int] = []
         # 纯 IoU 跟踪 — 用 numpy 数组存储轨迹（替代 dict，避免 Python 循环和列表推导式 GIL 开销）
@@ -99,6 +102,45 @@ class FrameProcessor:
             self._floor_kmh_cache[track_id] = SPEED_FLOOR_MIN + ratio * (SPEED_FLOOR_MAX - SPEED_FLOOR_MIN)
         return self._floor_kmh_cache[track_id]
 
+    def _estimate_vanishing_point(self, frame: np.ndarray) -> Optional[float]:
+        """估计道路消失点 y 坐标。整图 Canny + HoughLinesP，过滤水平/垂直线只保留斜线（车道线方向），
+        求线段对交点的中位数。返回 vp_y 或 None。每 30 帧调用一次，结果缓存到 _vp_y。"""
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=20)
+        if lines is None or len(lines) < 2:
+            return None
+        # 过滤水平/垂直线，只保留斜线（车道线方向，汇聚到道路消失点）
+        segments = []
+        for line in lines:
+            x1l, y1l, x2l, y2l = line[0]
+            angle = abs(np.arctan2(y2l - y1l, x2l - x1l) * 180.0 / np.pi)
+            if angle < 20 or angle > 80:
+                continue
+            segments.append((x1l, y1l, x2l, y2l))
+        if len(segments) < 2:
+            return None
+        # 求所有线段对的交点，取中位数（抗离群）
+        intersections = []
+        n = len(segments)
+        for i in range(n):
+            for j in range(i + 1, min(i + 30, n)):
+                x1a, y1a, x2a, y2a = segments[i]
+                x1b, y1b, x2b, y2b = segments[j]
+                d = (x1a - x2a) * (y1b - y2b) - (y1a - y2a) * (x1b - x2b)
+                if abs(d) < 1e-6:
+                    continue
+                t = ((x1a - x1b) * (y1b - y2b) - (y1a - y1b) * (x1b - x2b)) / d
+                ix = x1a + t * (x2a - x1a)
+                iy = y1a + t * (y2a - y1a)
+                if -w < ix < 2 * w and -h < iy < 2 * h:
+                    intersections.append((ix, iy))
+        if len(intersections) < 2:
+            return None
+        vp = np.median(np.array(intersections), axis=0)
+        return float(vp[1])
+
     def _get_color(self, track_id: int) -> sv.Color:
         if track_id not in self._track_colors:
             self._track_colors[track_id] = COLOR_PALETTE.by_idx(track_id % len(COLOR_PALETTE))
@@ -119,6 +161,13 @@ class FrameProcessor:
         - 简化 draw（去掉 COUNT ZONE 文字，减少 cv2 调用）
         """
         self.frame_count += 1
+        # 每 30 帧估计一次道路消失点（用于 _calc_speed_legacy 的非线性透视 scale）
+        self._vp_estimate_counter += 1
+        if self._vp_y is None or self._vp_estimate_counter >= 30:
+            self._vp_estimate_counter = 0
+            vp_y = self._estimate_vanishing_point(frame)
+            if vp_y is not None:
+                self._vp_y = vp_y
         now = time.time()
         _t = [time.perf_counter()]
 
@@ -413,7 +462,12 @@ class FrameProcessor:
         dist_px = (dx * dx + dy * dy) ** 0.5
         speed_px = dist_px / dt
         avg_cy = (first[1] + last[1]) / 2
-        scale = self._perspective_scale(avg_cy)
+        if self._vp_y is not None and avg_cy > self._vp_y:
+            # 消失点法：非线性透视缩放，底部=1.4（与原 _perspective_scale 底部一致），远处 >1.4
+            # 透视关系 1/(y-vp_y)：远处（avg_cy 接近 vp_y）放大倍数大，近处小
+            scale = 1.4 * (self.frame_h - self._vp_y) / (avg_cy - self._vp_y)
+        else:
+            scale = self._perspective_scale(avg_cy)  # 消失点不可用或车辆在消失点上方，回退线性
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
         # 静止判断：连续 2s 未移动才归零（避免单帧抖动/遮挡误归零）
