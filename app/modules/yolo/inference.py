@@ -29,6 +29,9 @@ NMS_OVERLAP = 0.5
 LOST_BUFFER = 5            # 降低 ByteTrack 丢失轨迹管理开销（原 15）
 TRAIL_MAX_AGE = 30
 PIXEL_TO_METER = 0.05
+# 新 track 冷启动初始速度（km/h）。城市道路常见速度，避免新车前几帧显示0。
+# 停着的车后续帧位移~0会被下限保护(<2归零)自然回落到0。
+COLD_START_KMH = 25.0
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
 
@@ -367,7 +370,7 @@ class FrameProcessor:
         self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
         pts = self._trajectories[track_id]
 
-        vel_kmh = self._speed_stable.get(track_id, 0.0)
+        vel_kmh = self._speed_stable.get(track_id, COLD_START_KMH)
 
         if len(pts) < 2:
             self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
@@ -387,13 +390,15 @@ class FrameProcessor:
         scale = self._perspective_scale(avg_cy)
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
-        if new_kmh < 2.0:
-            new_kmh = 0.0      # <2km/h 视为静止（停车/噪声）
-        elif new_kmh < 20.0:
-            new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
-        # EMA 平滑（避免抖动）
-        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
+        # 静止判断必须在 EMA 前：静止时不平滑直接归零，避免 EMA 把 0 拉回导致停不下来
+        is_static = new_kmh < 2.0
+        if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
+        # 下限保护（业务规则）：静止归零，动着的保底 20
+        if is_static:
+            new_kmh = 0.0
+        elif new_kmh < 20.0:
+            new_kmh = 20.0
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
@@ -410,7 +415,7 @@ class FrameProcessor:
         self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
         pts = self._trajectories[track_id]
 
-        vel_kmh = self._speed_stable.get(track_id, 0.0)
+        vel_kmh = self._speed_stable.get(track_id, COLD_START_KMH)
 
         if len(pts) < 2:
             self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
@@ -431,13 +436,15 @@ class FrameProcessor:
         speed_ms = dist_m / dt
         new_kmh = speed_ms * 3.6
 
-        # 与 legacy 保持一致的低速归零 + EMA 平滑，便于两种方法行为对齐
-        if new_kmh < 2.0:
-            new_kmh = 0.0      # <2km/h 视为静止（停车/噪声）
-        elif new_kmh < 20.0:
-            new_kmh = 20.0     # 业务规则：动着的车保底 20km/h（算法低估补偿）
-        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
+        # 静止判断必须在 EMA 前：静止时不平滑直接归零，避免 EMA 把 0 拉回导致停不下来
+        is_static = new_kmh < 2.0
+        if not is_static and vel_kmh > 0 and abs(new_kmh - vel_kmh) < 30:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
+        # 下限保护（业务规则）：静止归零，动着的保底 20
+        if is_static:
+            new_kmh = 0.0
+        elif new_kmh < 20.0:
+            new_kmh = 20.0
 
         self._speed_stable[track_id] = new_kmh
         self._speed_last_update[track_id] = now
