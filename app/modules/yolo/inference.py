@@ -23,13 +23,19 @@ except ImportError:  # pragma: no cover - 仅在精简环境中触发
 
 logger = logging.getLogger(__name__)
 
-MIN_CONFIDENCE = 0.1
+MIN_CONFIDENCE = 0.3       # 提高阈值减少检测框数量（原 0.1），大幅降低 ByteTrack 处理量
 NMS_OVERLAP = 0.5
-LOST_BUFFER = 15        # 降低 ByteTrack 跟踪状态管理开销（原 30）
-TRAIL_MAX_AGE = 30      # 降低轨迹清理频率（原 60）
+LOST_BUFFER = 5            # 降低 ByteTrack 丢失轨迹管理开销（原 15）
+TRAIL_MAX_AGE = 30
 PIXEL_TO_METER = 0.05
 
 COLOR_PALETTE = sv.ColorPalette.DEFAULT
+
+# cv2 直接绘制用 BGR 颜色，避免 supervision Color 转换开销
+_COLORS_BGR = [
+    (46, 168, 224), (164, 73, 163), (158, 216, 102), (40, 184, 240),
+    (92, 184, 92), (60, 76, 231), (180, 105, 255), (0, 215, 255),
+]
 
 
 class FrameProcessor:
@@ -80,6 +86,7 @@ class FrameProcessor:
     def process(self, model, frame: np.ndarray, device, results) -> tuple[list[dict], np.ndarray, dict]:
         self.frame_count += 1
         now = time.time()
+        _t = [time.perf_counter()]
 
         detections = sv.Detections.from_ultralytics(results)
         if len(detections) > 0 and detections.confidence is not None:
@@ -88,11 +95,13 @@ class FrameProcessor:
             detections = self._nms(detections)
 
         raw_boxes = [list(b) for b in (detections.xyxy.tolist() if detections.xyxy is not None else [])]
+        _t.append(time.perf_counter())
 
         if len(detections) > 0:
             detections = self.tracker.update_with_detections(detections)
         else:
             detections = sv.Detections.empty()
+        _t.append(time.perf_counter())
 
         actual_tids: set[int] = set()
         if len(detections) > 0 and detections.tracker_id is not None:
@@ -138,31 +147,44 @@ class FrameProcessor:
                 elif was_in and not is_in:
                     self._exit_events.append((now, tid))
                 self._inside_zone[tid] = is_in
+        _t.append(time.perf_counter())
 
         self._update_store(detection_list, speed_map)
         stats = self._compute_stats(detection_list, speed_map)
+        _t.append(time.perf_counter())
 
-        # supervision annotators: boxes + labels + traces
+        # cv2 直接绘制检测框+标签（替代 supervision BoxAnnotator/LabelAnnotator/TraceAnnotator，避免 Python 开销）
         if len(filtered) > 0:
-            labels = []
             for i in range(len(filtered)):
                 tid = int(filtered.tracker_id[i])
                 spd = speed_map.get(tid, 0.0)
                 cid = int(filtered.class_id[i]) if filtered.class_id is not None else -1
                 nm = self.class_names.get(cid, "?")
-                labels.append(f"{nm} {spd:.0f}km/h")
-            frame = self._box_annotator.annotate(scene=frame, detections=filtered)
-            frame = self._label_annotator.annotate(scene=frame, detections=filtered, labels=labels)
-            frame = self.trace_annotator.annotate(scene=frame, detections=filtered)
+                xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
+                x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
+                color = _COLORS_BGR[tid % len(_COLORS_BGR)]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                label = f"{nm} {spd:.0f}km/h"
+                cv2.putText(frame, label, (x1, max(y1 - 5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
         # draw counting zone + entry/exit counters
-        now_t = time.time()
-        self._prune_events(now_t)
+        self._prune_events(now)
         cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 2)
         cv2.putText(frame, "COUNT ZONE", (self.zx1 + 5, self.zy1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         flow = self.get_traffic_flow()
         for j, txt in enumerate([f"Entry:{flow['entry_count']}", f"Exit:{flow['exit_count']}", f"Flow:{flow['flow_per_min']}/min"]):
             cv2.putText(frame, txt, (self.zx1 + 5, self.zy2 - 10 - j * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        _t.append(time.perf_counter())
+
+        # 细分计时：超过 20ms 时打印各环节耗时，定位瓶颈
+        total_ms = (_t[-1] - _t[0]) * 1000
+        if total_ms > 20:
+            logger.warning(
+                "process cam=%s: parse=%.1f track=%.1f speed=%.1f store=%.1f draw=%.1f total=%.1fms",
+                self.cam_id,
+                (_t[1] - _t[0]) * 1000, (_t[2] - _t[1]) * 1000, (_t[3] - _t[2]) * 1000,
+                (_t[4] - _t[3]) * 1000, (_t[5] - _t[4]) * 1000, total_ms,
+            )
 
         self._cleanup_trails()
         return detection_list, frame, stats
