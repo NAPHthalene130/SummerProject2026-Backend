@@ -369,7 +369,11 @@ class BatchDetector:
         }
 
     def _process_single(self, cam_id: str, pending: PendingFrame, result) -> None:
-        frame = pending.frame.copy()
+        # pending.frame 来自 CameraStream 发布的"一次性"帧：已从 _pending 字典 pop 出来，
+        # 仅当前 worker 持有；CameraStream._raw_frame 独立存储，不会被并发读取。
+        # supervision annotator 在 frame 上原地绘制，set_processed_frame 写入的就是这个 annotated 帧。
+        # 因此可省略全帧 copy，减少 450 次/s 的 640×480×3 内存拷贝。
+        frame = pending.frame
 
         # Get or create FrameProcessor for this camera
         if cam_id not in self._processors:
