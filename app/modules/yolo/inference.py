@@ -42,7 +42,6 @@ class FrameProcessor:
     def __init__(self, cam_id: str, class_names: dict):
         self.cam_id = cam_id
         self.class_names = class_names
-        self.tracker = sv.ByteTrack(lost_track_buffer=LOST_BUFFER)
         self.trails: dict[int, list] = {}
         self.trail_age: dict[int, int] = {}
         self.frame_count = 0
@@ -57,17 +56,10 @@ class FrameProcessor:
         self._speed_last_update: dict[int, float] = {}
         self._speed_stable: dict[int, float] = {}
         self._track_colors: dict[int, sv.Color] = {}
-        self._lane_history: list[int] = []  # 滑动窗口平滑车道数（30帧≈2s 取众数）
-        # 跳帧跟踪：每 _track_interval 帧做完整 ByteTrack，中间帧用简化 IoU 匹配
-        self._track_interval = 3
-        self._last_track_boxes: dict[int, list[float]] = {}  # track_id → bbox（供中间帧 IoU 匹配）
-        self.trace_annotator = sv.TraceAnnotator(color=COLOR_PALETTE, position=sv.Position.CENTER, trace_length=15)
-        # 标注器在 __init__ 中创建一次复用，避免每帧 new 带来的 450 次/s 对象创建与 GC 压力
-        self._box_annotator = sv.BoxAnnotator(color=COLOR_PALETTE, thickness=2)
-        self._label_annotator = sv.LabelAnnotator(
-            color=COLOR_PALETTE, text_color=sv.Color.WHITE,
-            text_scale=0.35, text_thickness=1,
-        )
+        self._lane_history: list[int] = []
+        # 纯 IoU 跟踪（完全去掉 ByteTrack，消除卡尔曼滤波 GIL 开销）
+        self._last_track_boxes: dict[int, list[float]] = {}  # track_id → bbox
+        self._next_track_id: int = 1
 
     def init_zone(self, h: int, w: int, margin: float = 0.15):
         self.frame_h, self.frame_w = h, w
@@ -91,46 +83,28 @@ class FrameProcessor:
         now = time.time()
         _t = [time.perf_counter()]
 
-        detections = sv.Detections.from_ultralytics(results)
+        # 手动构造 Detections（替代 sv.Detections.from_ultralytics，减少 ~2.5ms GIL）
+        if hasattr(results, 'boxes') and results.boxes is not None and len(results.boxes) > 0:
+            detections = sv.Detections(
+                xyxy=results.boxes.xyxy.cpu().numpy(),
+                confidence=results.boxes.conf.cpu().numpy(),
+                class_id=results.boxes.cls.cpu().numpy().astype(int),
+            )
+        else:
+            detections = sv.Detections.empty()
+
         if len(detections) > 0 and detections.confidence is not None:
             detections = detections[detections.confidence >= MIN_CONFIDENCE]
         if len(detections) > 1 and detections.xyxy is not None:
             detections = self._nms(detections)
-
-        raw_boxes = [list(b) for b in (detections.xyxy.tolist() if detections.xyxy is not None else [])]
         _t.append(time.perf_counter())
 
-        # 跳帧跟踪：每 _track_interval 帧做完整 ByteTrack（卡尔曼滤波+匈牙利匹配），
-        # 中间帧用简化 IoU 匹配（<1ms），保持 track_id 连续，不丢 ID，不影响车流量计算。
-        do_full_track = (self.frame_count % self._track_interval == 0)
-        if do_full_track:
-            if len(detections) > 0:
-                detections = self.tracker.update_with_detections(detections)
-            else:
-                detections = sv.Detections.empty()
-            # 保存跟踪结果供中间帧 IoU 匹配
-            self._last_track_boxes = {}
-            if len(detections) > 0 and detections.tracker_id is not None:
-                for i in range(len(detections)):
-                    self._last_track_boxes[int(detections.tracker_id[i])] = detections.xyxy[i].tolist()
-        else:
-            detections = self._simple_iou_match(detections)
+        # 纯 IoU 跟踪（完全去掉 ByteTrack，消除卡尔曼滤波 GIL 开销 ~5ms）
+        detections = self._simple_iou_match(detections)
         _t.append(time.perf_counter())
 
-        actual_tids: set[int] = set()
-        if len(detections) > 0 and detections.tracker_id is not None:
-            for i in range(len(detections)):
-                tid = int(detections.tracker_id[i])
-                xyxy = detections.xyxy[i].tolist() if detections.xyxy is not None else None
-                if xyxy is None:
-                    continue
-                for rb in raw_boxes:
-                    if all(abs(xyxy[k] - rb[k]) < 10 for k in range(4)):
-                        actual_tids.add(tid)
-                        break
-
-        idx = [i for i in range(len(detections)) if detections.tracker_id is not None and int(detections.tracker_id[i]) in actual_tids]
-        filtered = detections[idx] if len(detections) > 0 and idx else detections
+        # 直接用 detections 作为 filtered（去掉 actual_tids 过滤，减少 ~1ms Python 循环）
+        filtered = detections
 
         detection_list: list[dict] = []
         speed_map: dict[int, float] = {}
@@ -144,8 +118,6 @@ class FrameProcessor:
                 xyxy = filtered.xyxy[i].tolist() if filtered.xyxy is not None else [0, 0, 0, 0]
                 detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
 
-                # tid=-1 表示跳帧中间帧 IoU 未匹配的检测框，跳过轨迹/速度/zone 逻辑
-                # 不影响车流量统计（不触发 entry/exit），速度为 0
                 if tid == -1:
                     speed_map[tid] = 0.0
                     continue
@@ -174,7 +146,7 @@ class FrameProcessor:
         stats = self._compute_stats(detection_list, speed_map)
         _t.append(time.perf_counter())
 
-        # cv2 直接绘制检测框+标签（替代 supervision BoxAnnotator/LabelAnnotator/TraceAnnotator，避免 Python 开销）
+        # cv2 直接绘制（释放 GIL）
         if len(filtered) > 0:
             for i in range(len(filtered)):
                 tid = int(filtered.tracker_id[i])
@@ -188,7 +160,6 @@ class FrameProcessor:
                 label = f"{nm} {spd:.0f}km/h"
                 cv2.putText(frame, label, (x1, max(y1 - 5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        # draw counting zone + entry/exit counters
         self._prune_events(now)
         cv2.rectangle(frame, (self.zx1, self.zy1), (self.zx2, self.zy2), (0, 255, 255), 2)
         cv2.putText(frame, "COUNT ZONE", (self.zx1 + 5, self.zy1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
@@ -197,7 +168,6 @@ class FrameProcessor:
             cv2.putText(frame, txt, (self.zx1 + 5, self.zy2 - 10 - j * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         _t.append(time.perf_counter())
 
-        # 细分计时：超过 20ms 时打印各环节耗时，定位瓶颈
         total_ms = (_t[-1] - _t[0]) * 1000
         if total_ms > 20:
             logger.warning(
@@ -261,8 +231,13 @@ class FrameProcessor:
         if len(detections) == 0:
             return detections
         if len(self._last_track_boxes) == 0:
-            # 无历史轨迹，所有检测框 track_id=-1（下次 ByteTrack 帧重新分配）
-            detections.tracker_id = np.full(len(detections), -1, dtype=int)
+            # 无历史轨迹（第一帧），为所有检测框分配新 ID
+            N = len(detections)
+            tracker_ids = np.arange(self._next_track_id, self._next_track_id + N, dtype=int)
+            for i in range(N):
+                self._last_track_boxes[int(tracker_ids[i])] = detections.xyxy[i].tolist()
+            self._next_track_id += N
+            detections.tracker_id = tracker_ids
             return detections
 
         det_boxes = np.asarray(detections.xyxy, dtype=np.float32)
@@ -295,13 +270,20 @@ class FrameProcessor:
             if best_j >= 0:
                 tracker_ids[i] = track_ids[best_j]
                 used.add(best_j)
-                # 更新轨迹 bbox 供下一中间帧匹配
                 self._last_track_boxes[track_ids[best_j]] = det_boxes[i].tolist()
+
+        # 未匹配的检测框分配新 ID（保证车流量计数正确）
+        for i in range(N):
+            if tracker_ids[i] == -1:
+                tracker_ids[i] = self._next_track_id
+                self._next_track_id += 1
+                self._last_track_boxes[int(tracker_ids[i])] = det_boxes[i].tolist()
 
         detections.tracker_id = tracker_ids
         return detections
 
     def _calc_speed(self, track_id: int, cx: float, cy: float, now: float) -> float:
+        """简化速度计算：用最近两帧位移代替 polyfit，减少 GIL 持有时间。"""
         traj = self._trajectories.setdefault(track_id, [])
         traj.append((cx, cy, now))
         cutoff = now - 2.0
@@ -313,35 +295,21 @@ class FrameProcessor:
         if now - lu < 0.6:
             return vel_kmh
 
-        if len(pts) < 4:
-            prev = self._prev_positions.get(track_id)
-            if prev:
-                dp = np.sqrt((cx - prev["cx"])**2 + (cy - prev["cy"])**2)
-                scale = self._perspective_scale(cy)
-                vel_kmh = dp * PIXEL_TO_METER * scale * 3.6 * 30
-            self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
-            self._speed_last_update[track_id] = now
-            if vel_kmh < 0.5:
-                vel_kmh = 0.0
-            self._speed_stable[track_id] = vel_kmh
-            return vel_kmh
-
-        xs = np.array([p[0] for p in pts])
-        ys = np.array([p[1] for p in pts])
-        ts = np.array([p[2] for p in pts])
-        dt = ts[-1] - ts[0]
-        if dt < 0.2:
+        if len(pts) < 2:
             self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
             return vel_kmh
 
-        try:
-            slope, _ = np.polyfit(ts, xs, 1)
-            speed_px = abs(slope)
-        except np.linalg.LinAlgError:
-            dx = xs[-1] - xs[0]
-            speed_px = abs(dx) / max(dt, 0.01)
-
-        avg_cy = float(np.mean(ys))
+        # 简单位移/时间（替代 polyfit，减少 ~1ms GIL）
+        first = pts[0]
+        last = pts[-1]
+        dx = last[0] - first[0]
+        dy = last[1] - first[1]
+        dt = last[2] - first[2]
+        if dt < 0.01:
+            dt = 0.01
+        dist_px = (dx * dx + dy * dy) ** 0.5
+        speed_px = dist_px / dt
+        avg_cy = (first[1] + last[1]) / 2
         scale = self._perspective_scale(avg_cy)
         new_kmh = speed_px * PIXEL_TO_METER * scale * 3.6
 
