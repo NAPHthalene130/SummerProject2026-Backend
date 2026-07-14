@@ -141,12 +141,9 @@ class CameraStream:
         self.request_stop()
         thread = self._cap_thread
         if thread is not None:
-            timeout = max(RTSP_OPEN_TIMEOUT_MS, RTSP_READ_TIMEOUT_MS) / 1000.0 + 2.0
+            timeout = min(RTSP_READ_TIMEOUT_MS / 1000.0, 3.0) + 1.0
             thread.join(timeout=timeout)
             if thread.is_alive():
-                # Releasing VideoCapture from a second thread can crash FFmpeg.
-                # Leave the daemon to observe its configured timeout and let its
-                # own finally block release the native handle safely.
                 logger.error(
                     "[%s] RTSP capture thread is still stopping after %.1fs",
                     self.config.id,
