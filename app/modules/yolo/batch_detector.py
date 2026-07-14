@@ -251,17 +251,12 @@ class BatchDetector:
         selected: list[tuple[str, PendingFrame]] = []
         with self._pending_lock:
             for cam_id in list(self._pending):
-                if cam_id in self._post_inflight:
-                    continue
                 pending = self._pending.pop(cam_id)
-                self._post_inflight.add(cam_id)
                 selected.append((cam_id, pending))
                 if len(selected) >= BATCH_SIZE:
                     break
 
-            has_eligible_pending = any(
-                cam_id not in self._post_inflight for cam_id in self._pending
-            )
+            has_eligible_pending = len(self._pending) > 0
             if has_eligible_pending:
                 self._pending_event.set()
             else:
@@ -299,21 +294,28 @@ class BatchDetector:
 
         completed_items = items[:len(results)]
         if not self._running:
-            for cam_id, _ in completed_items:
-                self._release_inflight(cam_id)
-            return
-        pool = self._post_pool
-        if pool is None:
-            for (cam_id, pending), result in zip(completed_items, results):
-                self._postprocess_job(cam_id, pending, result)
             return
 
-        # Deliberately do not wait for these futures.  The inference thread can
-        # immediately launch the next GPU batch while eight CPU workers track and
-        # draw the previous one.  Per-camera in-flight guards keep ByteTrack serial.
+        pool = self._post_pool
         for (cam_id, pending), result in zip(completed_items, results):
+            # ★ 关键优化：推理后立即推送原始帧到 WebRTC（不等后处理，视频流畅）
+            # process() 已不画框（draw=0），原始帧就是最终帧
+            with self._streams_lock:
+                s = self._streams.get(cam_id)
+            if s is not None:
+                s.set_processed_frame(pending.frame, frame_id=pending.frame_id, captured_at=pending.captured_at)
+
+            # 后处理异步：如果该路已在后处理中，跳过（latest-only，避免积压）
+            # 后处理只更新 CameraDataStore/SSE/LSTM，不影响 WebRTC 视频
+            with self._pending_lock:
+                if cam_id in self._post_inflight:
+                    continue
+                self._post_inflight.add(cam_id)
             try:
-                pool.submit(self._postprocess_job, cam_id, pending, result)
+                if pool is not None:
+                    pool.submit(self._postprocess_job, cam_id, pending, result)
+                else:
+                    self._postprocess_job(cam_id, pending, result)
             except RuntimeError:
                 self._release_inflight(cam_id)
 
@@ -458,15 +460,7 @@ class BatchDetector:
             except Exception:
                 pass
 
-        # Push annotated frame to stream (preserve dev2's frame_id/captured_at signature)
-        with self._streams_lock:
-            s = self._streams.get(cam_id)
-        if s is not None:
-            s.set_processed_frame(
-                annotated,
-                frame_id=pending.frame_id,
-                captured_at=pending.captured_at,
-            )
+        # set_processed_frame 已移到 _process_batch（推理后立即推送原始帧，不等后处理）
 
     def get_traffic_flow(self, cam_id: str) -> dict:
         fp = self._processors.get(cam_id)
