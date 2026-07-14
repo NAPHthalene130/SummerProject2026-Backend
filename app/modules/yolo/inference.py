@@ -159,7 +159,6 @@ class FrameProcessor:
                 self.trail_age[tid] = self.frame_count
 
                 vel_kmh = self._calc_speed(tid, cx, cy, now)
-                detection_list.append({"track_id": tid, "class_name": cls_name, "confidence": conf, "bbox": xyxy})
                 speed_map[tid] = vel_kmh
 
                 was_in = self._inside_zone.get(tid, False)
