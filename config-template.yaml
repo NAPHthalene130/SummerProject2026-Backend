@@ -65,6 +65,14 @@ lane_segmentation:
   interval: 5.0
   image_size: 640
 
+# BEV 透视变换标定（鸟瞰图速度计算）。
+# 每路摄像头需 4 个标定点：图像坐标 src (px) → 地面坐标 dst (米)。
+# 未列出的摄像头回退到 inference.py 的 _calc_speed_legacy()（PIXEL_TO_METER + 线性 scale）。
+# 标定方法：截图后选取车道线 4 角，按车道线间距（默认 3.75m）推算地面坐标。
+# 留空字典 {} 表示全部回退到旧方法，可逐路补充。
+bev_calibration: {}
+bev_calibration_lane_width_m: 3.75
+
 cameras:
   - id: "cam-01"
     name: "苏州街-海淀南路"

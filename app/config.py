@@ -182,6 +182,13 @@ class AppSettings:
         self.LANE_SEG_INTERVAL: float = val("lane_segmentation", "interval", 5.0, coerce=_float_coerce, env_var="SP2026_LANE_SEG_INTERVAL")
         self.LANE_SEG_IMAGE_SIZE: int = val("lane_segmentation", "image_size", 640, coerce=_int_coerce, env_var="SP2026_LANE_SEG_IMAGE_SIZE")
 
+        # BEV 透视变换标定（鸟瞰图速度计算）。结构：{cam_id: {"src": [[x,y]*4], "dst": [[mx,my]*4]}}。
+        # 留空 / 摄像头未列出时，inference.py 回退到 _calc_speed_legacy()。嵌套结构不支持环境变量覆盖。
+        bev_section = yaml_data.get("bev_calibration", {}) or {}
+        self.BEV_CALIBRATION: dict[str, dict] = bev_section if isinstance(bev_section, dict) else {}
+        # 标定推算地面坐标时使用的单车道宽度（米），默认 3.75m（国标城市道路单车道宽度）。
+        self.BEV_LANE_WIDTH_M: float = float(yaml_data.get("bev_calibration_lane_width_m", 3.75))
+
 
 _yaml_data = load_yaml_config()
 settings = AppSettings(_yaml_data)
