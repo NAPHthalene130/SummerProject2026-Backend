@@ -1,4 +1,6 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 
 from app.models.user import StaffResponse
 from app.models.work_order import (
@@ -11,8 +13,56 @@ from app.models.work_order import (
 from app.repository.work_order_repository import WorkOrderRepository
 
 
+class CameraUnprocessedEvents(BaseModel):
+    camera_id: str
+    camera_name: str
+    events: list[WorkOrderItemResponse]
+
+
+class UnprocessedResponse(BaseModel):
+    cameras: list[CameraUnprocessedEvents]
+
+
 work_orders_router = APIRouter()
 staff_router = APIRouter()
+
+
+@work_orders_router.get("/unprocessed", response_model=UnprocessedResponse)
+async def list_unprocessed():
+    all_orders = WorkOrderRepository.list_work_orders()
+    unprocessed = [
+        wo for wo in all_orders
+        if wo.status not in ("completed", "ignored")
+    ]
+    by_camera: dict[str, list[WorkOrderItemResponse]] = {}
+    camera_names: dict[str, str] = {}
+    for wo in unprocessed:
+        cid = wo.camera_id or "unknown"
+        if cid not in by_camera:
+            by_camera[cid] = []
+            camera_names[cid] = wo.camera_name or "未知摄像头"
+        by_camera[cid].append(wo)
+
+    cameras = sorted(
+        [
+            CameraUnprocessedEvents(
+                camera_id=cid,
+                camera_name=camera_names[cid],
+                events=sorted(evts, key=lambda e: e.event_time or "", reverse=True),
+            )
+            for cid, evts in by_camera.items()
+        ],
+        key=lambda c: c.camera_id,
+    )
+    return UnprocessedResponse(cameras=cameras)
+
+
+@work_orders_router.get("/detail/{work_order_id}", response_model=WorkOrderItemResponse)
+async def get_work_order_detail(work_order_id: str):
+    wo = WorkOrderRepository.get_work_order(work_order_id)
+    if wo is None:
+        raise HTTPException(status_code=404, detail=f"Work order '{work_order_id}' not found")
+    return wo
 
 
 @work_orders_router.get("/", response_model=list[WorkOrderItemResponse])
