@@ -3,6 +3,7 @@
 import logging
 import time
 from collections import Counter
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -39,9 +40,12 @@ _COLORS_BGR = [
 
 
 class FrameProcessor:
-    def __init__(self, cam_id: str, class_names: dict):
+    def __init__(self, cam_id: str, class_names: dict, bev_matrix: Optional[np.ndarray] = None):
         self.cam_id = cam_id
         self.class_names = class_names
+        # BEV 透视矩阵 (3x3 float32)。None 时 _calc_speed 回退到 _calc_speed_legacy()。
+        # 由 BatchDetector 根据 config.yaml 的 bev_calibration 在创建 FrameProcessor 时计算并传入。
+        self._bev_matrix = bev_matrix
         self.trails: dict[int, list] = {}
         self.trail_age: dict[int, int] = {}
         self.frame_count = 0
@@ -349,7 +353,14 @@ class FrameProcessor:
         return detections
 
     def _calc_speed(self, track_id: int, cx: float, cy: float, now: float) -> float:
-        """简化速度计算：用最近两帧位移代替 polyfit，减少 GIL 持有时间。"""
+        """速度计算入口：有 BEV 标定时走透视变换，否则回退到 legacy 像素位移法。"""
+        if self._bev_matrix is not None:
+            return self._calc_speed_bev(track_id, cx, cy, now)
+        return self._calc_speed_legacy(track_id, cx, cy, now)
+
+    def _calc_speed_legacy(self, track_id: int, cx: float, cy: float, now: float) -> float:
+        """旧速度计算：像素位移 × PIXEL_TO_METER × 线性透视 scale。
+        远处车辆因线性 scale 近似误差大，故作为 BEV 未标定时的回退。"""
         traj = self._trajectories.setdefault(track_id, [])
         traj.append((cx, cy, now))
         cutoff = now - 2.0
@@ -379,6 +390,48 @@ class FrameProcessor:
         if new_kmh < 1.0:
             new_kmh = 0.0
         # EMA 平滑（避免抖动）
+        if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
+            new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
+
+        self._speed_stable[track_id] = new_kmh
+        self._speed_last_update[track_id] = now
+        self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": new_kmh, "_vel_mps": new_kmh / 3.6}
+        return new_kmh
+
+    def _calc_speed_bev(self, track_id: int, cx: float, cy: float, now: float) -> float:
+        """BEV 透视变换速度计算：图像坐标 (px,py) 经 _bev_matrix 变换到地面坐标 (米)，
+        在地面坐标系计算真实位移/时间。透视变换非线性，能正确处理近大远小，
+        远处车辆误差显著低于 _calc_speed_legacy 的线性 scale 近似。"""
+        traj = self._trajectories.setdefault(track_id, [])
+        traj.append((cx, cy, now))
+        cutoff = now - 2.0
+        self._trajectories[track_id] = [(x, y, t) for x, y, t in traj if t > cutoff]
+        pts = self._trajectories[track_id]
+
+        vel_kmh = self._speed_stable.get(track_id, 0.0)
+
+        if len(pts) < 2:
+            self._prev_positions[track_id] = {"cx": cx, "cy": cy, "_vel": vel_kmh, "_vel_mps": vel_kmh / 3.6}
+            return vel_kmh
+
+        # 图像坐标 → 地面坐标（米），一次性批量透视变换
+        src_points = np.array([(p[0], p[1]) for p in pts], dtype=np.float32).reshape(-1, 1, 2)
+        ground = cv2.perspectiveTransform(src_points, self._bev_matrix).reshape(-1, 2)
+
+        first = ground[0]
+        last = ground[-1]
+        dx = last[0] - first[0]   # 地面 x 位移（米）
+        dy = last[1] - first[1]   # 地面 y 位移（米）
+        dt = pts[-1][2] - pts[0][2]
+        if dt < 0.01:
+            dt = 0.01
+        dist_m = (dx * dx + dy * dy) ** 0.5
+        speed_ms = dist_m / dt
+        new_kmh = speed_ms * 3.6
+
+        # 与 legacy 保持一致的低速归零 + EMA 平滑，便于两种方法行为对齐
+        if new_kmh < 1.0:
+            new_kmh = 0.0
         if vel_kmh > 0 and abs(new_kmh - vel_kmh) < 15:
             new_kmh = vel_kmh * 0.6 + new_kmh * 0.4
 
