@@ -88,6 +88,8 @@ class CameraDataStore:
                     cls._instance._traffic_metrics: dict[str, dict[str, float]] = {}
                     cls._instance._active_incidents: dict[str, set[str]] = {}
                     cls._instance._consecutive_normal_count: dict[str, int] = {}
+                    # 车道数缓存：由 LaneSegmentationWorker 每 5s 更新，inference.py 优先读取此缓存
+                    cls._instance._lane_count_cache: dict[str, int] = {}
         return cls._instance
 
     def update(
@@ -139,6 +141,14 @@ class CameraDataStore:
     def get_traffic_metrics(self, camera_id: str) -> Optional[dict[str, float]]:
         metrics = self._traffic_metrics.get(camera_id)
         return dict(metrics) if metrics else None
+
+    def update_lane_count(self, camera_id: str, lane_count: int) -> None:
+        """由 LaneSegmentationWorker 调用，缓存车道线分割模型推理结果。"""
+        self._lane_count_cache[camera_id] = int(lane_count)
+
+    def get_lane_count(self, camera_id: str) -> Optional[int]:
+        """inference.py 优先读取此缓存；为 None 时回退到 _estimate_lanes() 启发式。"""
+        return self._lane_count_cache.get(camera_id)
 
     def update_incident_result(self, camera_id: str, result: TrafficIncidentResult) -> None:
         self._incident_data[camera_id] = result
