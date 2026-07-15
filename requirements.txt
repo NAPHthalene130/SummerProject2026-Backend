@@ -3,3 +3,23 @@ uvicorn[standard]>=0.30.0,<1.0.0
 pydantic>=2.0.0,<3.0.0
 pydantic-settings>=2.0.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
+python-multipart>=0.0.9,<1.0.0
+pyyaml>=6.0,<7.0.0
+opencv-python>=4.9.0,<5.0.0
+aiortc>=1.9.0,<2.0.0
+av>=12.0.0,<13.0.0
+numpy>=1.26.0,<2.0.0
+ultralytics>=8.3.0,<9.0.0
+# BatchDetector currently uses supervision.ByteTrack; it is removed in 0.30.
+supervision>=0.22.0,<0.30.0
+openai>=1.0.0,<3.0.0
+langchain>=1.0.0,<2.0.0
+langchain-openai>=1.0.0,<2.0.0
+chromadb>=1.5.9,<2.0.0
+PyMySQL>=1.1.0,<2.0.0
+pwdlib[argon2]>=0.2.0,<1.0.0
+torch>=2.0.0
+joblib>=1.4.0,<2.0.0
+pandas>=2.2.0,<3.0.0
+scikit-learn==1.7.2
+catboost>=1.2.0,<2.0.0

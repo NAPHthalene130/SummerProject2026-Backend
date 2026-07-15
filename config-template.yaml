@@ -1,0 +1,226 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+  reload: false
+  cors_origins:
+    - "*"
+
+database:
+  host: "127.0.0.1"
+  port: 3306
+  username: "root"
+  password: "123456"
+  name: "summer_project_2026"
+  charset: "utf8mb4"
+
+llm:
+  url: "https://api.openai.com/v1"
+  api_key: "your_api_key_here"
+  model_name: "your_model_name_here"
+
+embedding:
+  url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key: "your_api_key_here"
+  model_name: "text-embedding-v4"
+  dimensions: 1024
+  concurrency: 10
+  timeout: 60.0
+
+streaming:
+  enabled: true
+  traffic_analyst_enabled: true
+  fps: 15
+  detect_resize_width: 0
+
+rtsp:
+  open_timeout_ms: 5000
+  read_timeout_ms: 5000
+  connect_concurrency: 4
+  reconnect_delay: 1.0
+  max_reconnect_delay: 30.0
+  startup_spread_seconds: 2.0
+  stale_frame_seconds: 6.0
+  processed_stale_frame_seconds: 8.0
+  hw_acceleration: false
+
+yolo:
+  model_path: ""
+  batch_size: 30
+  post_workers: 20
+  opencv_threads: 1
+  batch_collect_ms: 66.0
+  image_size: 640
+  half: true
+
+risk:
+  model_path: ""
+
+# 道路分割（车道线检测）独立推理 worker。
+# model_path 为空时 worker 不启动，inference.py 回退到 _estimate_lanes() + 滑动窗口平滑。
+# 配置车道线分割模型路径后，worker 每 interval 秒对 30 路串行推理，结果缓存到 CameraDataStore.lane_count。
+lane_segmentation:
+  enabled: false
+  model_path: ""
+  interval: 5.0
+  image_size: 640
+
+# BEV 透视变换标定（鸟瞰图速度计算）。
+# 每路摄像头需 4 个标定点：图像坐标 src (px) → 地面坐标 dst (米)。
+# 未列出的摄像头回退到 inference.py 的 _calc_speed_legacy()（PIXEL_TO_METER + 线性 scale）。
+# 标定方法：截图后选取车道线 4 角，按车道线间距（默认 3.75m）推算地面坐标。
+# 留空字典 {} 表示全部回退到旧方法，可逐路补充。
+bev_calibration: {}
+bev_calibration_lane_width_m: 3.75
+
+cameras:
+  - id: "cam-01"
+    name: "苏州街-海淀南路"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live1"
+    longitude: 116.30705
+    latitude: 39.972601
+  - id: "cam-02"
+    name: "海淀黄庄路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live2"
+    longitude: 116.3175
+    latitude: 39.973
+  - id: "cam-03"
+    name: "知春里路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live3"
+    longitude: 116.331
+    latitude: 39.973
+  - id: "cam-04"
+    name: "西土城路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live4"
+    longitude: 116.348
+    latitude: 39.973
+  - id: "cam-05"
+    name: "苏州街-丹棱街"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live5"
+    longitude: 116.307
+    latitude: 39.979
+  - id: "cam-06"
+    name: "中关村大街-丹棱街"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live6"
+    longitude: 116.3175
+    latitude: 39.979
+  - id: "cam-07"
+    name: "科学院南路路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live7"
+    longitude: 116.331
+    latitude: 39.979
+  - id: "cam-08"
+    name: "蓟门桥北"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live8"
+    longitude: 116.348
+    latitude: 39.979
+  - id: "cam-09"
+    name: "海淀桥"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live9"
+    longitude: 116.307
+    latitude: 39.984
+  - id: "cam-10"
+    name: "中关村一桥"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live10"
+    longitude: 116.3175
+    latitude: 39.984
+  - id: "cam-11"
+    name: "保福寺桥"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live11"
+    longitude: 116.331
+    latitude: 39.984
+  - id: "cam-12"
+    name: "学院桥"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live12"
+    longitude: 116.348
+    latitude: 39.984
+  - id: "cam-13"
+    name: "北大西门南"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live13"
+    longitude: 116.307
+    latitude: 39.988
+  - id: "cam-14"
+    name: "北大东门南"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live14"
+    longitude: 116.3175
+    latitude: 39.988
+  - id: "cam-15"
+    name: "清华科技园"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live15"
+    longitude: 116.331
+    latitude: 39.988
+  - id: "cam-16"
+    name: "北语东门"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live16"
+    longitude: 116.3485
+    latitude: 39.988
+  - id: "cam-17"
+    name: "圆明园南门西"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live17"
+    longitude: 116.307
+    latitude: 39.993
+  - id: "cam-18"
+    name: "北京大学东门"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live18"
+    longitude: 116.3175
+    latitude: 39.993
+  - id: "cam-19"
+    name: "五道口路口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live19"
+    longitude: 116.331
+    latitude: 39.993
+  - id: "cam-20"
+    name: "六道口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live20"
+    longitude: 116.348
+    latitude: 39.993
+  - id: "cam-21"
+    name: "清华西门西"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live21"
+    longitude: 116.307
+    latitude: 40.001
+  - id: "cam-22"
+    name: "清华大学西门"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live22"
+    longitude: 116.3175
+    latitude: 40.001
+  - id: "cam-23"
+    name: "清华大学东门"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live23"
+    longitude: 116.331
+    latitude: 40.001
+  - id: "cam-24"
+    name: "矿大东门"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live24"
+    longitude: 116.348
+    latitude: 40.001
+  - id: "cam-25"
+    name: "海淀南路中段"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live25"
+    longitude: 116.312
+    latitude: 39.973
+  - id: "cam-26"
+    name: "知春路中段"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live26"
+    longitude: 116.324
+    latitude: 39.973
+  - id: "cam-27"
+    name: "中关村大街中段"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live27"
+    longitude: 116.3175
+    latitude: 39.9815
+  - id: "cam-28"
+    name: "中关村东路中段"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live28"
+    longitude: 116.331
+    latitude: 39.9885
+  - id: "cam-29"
+    name: "成府路中段"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live29"
+    longitude: 116.324
+    latitude: 39.993
+  - id: "cam-30"
+    name: "清华东路西口"
+    url: "rtsp://10.126.59.120:8554/liveDemo/live30"
+    longitude: 116.3395
+    latitude: 39.993
