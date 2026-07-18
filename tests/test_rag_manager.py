@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app.config import EmbeddingSettings
 from app.modules.agent.rag.rag_manager import (
     POLICY_DATABASES,
@@ -143,6 +145,7 @@ def test_search_rag_rejects_empty_prompt() -> None:
 def test_real_chromadb_persists_and_reuses_two_databases(
     tmp_path, monkeypatch
 ) -> None:
+    pytest.importorskip("chromadb", reason="chromadb 未安装,跳过真实向量库集成测试")
     rag_module = importlib.import_module("app.modules.agent.rag.rag_manager")
     database_root = tmp_path / "chroma_db"
     policies = []

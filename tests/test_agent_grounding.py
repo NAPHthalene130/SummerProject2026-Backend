@@ -34,20 +34,27 @@ def _work_order(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_work_order_detail_marks_file_metadata_as_unverified_content() -> None:
+def test_work_order_detail_exposes_file_and_result_flags() -> None:
+    """详情工具必须暴露图片数量与处置结果存在性标记,供Agent区分数据库记录与未核验内容。"""
     work_order = _work_order()
     with patch.object(tool.WorkOrderRepository, "get_work_order", return_value=work_order):
         payload = json.loads(tool.get_work_order_detail(work_order.work_order_id))
 
-    assert payload["evidence"]["entity"] == "work_order_detail"
-    assert payload["result_evidence"]["result_is_database_recorded"] is True
-    assert payload["result_evidence"]["result_content_independently_verified"] is False
-    assert payload["file_evidence"]["process_image_urls"] == ["/orderImg/result-144.jpg"]
-    assert payload["file_evidence"]["content_verified"] is False
-    assert payload["file_evidence"]["existence_verified"] is False
+    # 数据库记录字段原样返回
+    assert payload["work_order_id"] == "WO-20260712-144"
+    assert payload["description"] == "两车发生碰撞。"
+    assert payload["process_message"] == "现场已完成清障。"
+    # 文件/结果存在性标记:Agent 据此判断哪些内容有数据库记录支撑
+    assert payload["scene_image_count"] == 1
+    assert payload["process_image_count"] == 1
+    assert payload["has_process_message"] is True
+    assert payload["has_completed_at"] is True
+    # 工具只返回图片计数,不返回图片内容本身
+    assert "data:image" not in json.dumps(payload)
 
 
 def test_work_order_detail_does_not_claim_missing_result_evidence() -> None:
+    """未完成工单没有处置记录,工具不得返回暗示已有处置结果的字段值。"""
     work_order = _work_order(
         status="pending",
         process_message=None,
@@ -59,9 +66,10 @@ def test_work_order_detail_does_not_claim_missing_result_evidence() -> None:
     with patch.object(tool.WorkOrderRepository, "get_work_order", return_value=work_order):
         payload = json.loads(tool.get_work_order_detail(work_order.work_order_id))
 
-    assert payload["result_evidence"]["result_is_database_recorded"] is False
-    assert payload["file_evidence"]["process_image_count"] == 0
-    assert payload["file_evidence"]["process_image_urls"] == []
+    assert payload["process_message"] is None
+    assert payload["process_image_count"] == 0
+    assert payload["has_process_message"] is False
+    assert payload["has_completed_at"] is False
 
 
 def test_regulation_tool_returns_structured_citations() -> None:
@@ -73,15 +81,15 @@ def test_regulation_tool_returns_structured_citations() -> None:
     with patch.object(tool, "_search_regulations", return_value=search_result):
         payload = json.loads(tool.answer_general_question("发生事故后如何处理"))
 
-    assert payload["evidence"]["matched_reference_count"] == 1
     assert payload["rag_references"] == [
         {
-            "source_type": "regulation_knowledge_base",
-            "title": "中华人民共和国道路交通安全法",
+            "law": "中华人民共和国道路交通安全法",
             "article": "第五章第七十条",
             "excerpt": "发生交通事故后应当立即停车。",
         }
     ]
+    # 工具必须提示Agent:仅可引用实际检索到的条款
+    assert "rag_references" in payload["note"]
 
 
 def test_suggest_handling_keeps_database_and_rag_evidence_separate() -> None:
@@ -100,14 +108,25 @@ def test_suggest_handling_keeps_database_and_rag_evidence_separate() -> None:
     ):
         payload = json.loads(tool.suggest_handling(work_order.work_order_id))
 
-    assert payload["evidence"]["source_type"] == "database"
-    assert payload["rag_references"][0]["source_type"] == "regulation_knowledge_base"
-    assert payload["file_evidence"]["content_verified"] is False
+    # 数据库来源字段与RAG检索依据分属不同键,不得混排
+    assert payload["work_order_id"] == "WO-20260712-144"
+    assert payload["accident_type"] == "车辆碰撞"
+    assert payload["current_stage"] == "pending"
+    assert payload["rag_references"] == [
+        {
+            "law": "中华人民共和国道路交通安全法实施条例",
+            "article": "第一章第一条",
+            "excerpt": "依据道路交通安全法制定本条例。",
+        }
+    ]
+    # 现场照片文件不存在于磁盘时,不得编造图像分析结论
+    assert payload["image_analysis"] == ""
+    assert payload["stage_guidance"]
 
 
 class AgentGroundingTests(unittest.TestCase):
     def test_detail_file_metadata_boundary(self) -> None:
-        test_work_order_detail_marks_file_metadata_as_unverified_content()
+        test_work_order_detail_exposes_file_and_result_flags()
 
     def test_missing_result_evidence(self) -> None:
         test_work_order_detail_does_not_claim_missing_result_evidence()
@@ -117,3 +136,7 @@ class AgentGroundingTests(unittest.TestCase):
 
     def test_database_and_rag_evidence_are_separate(self) -> None:
         test_suggest_handling_keeps_database_and_rag_evidence_separate()
+
+
+if __name__ == "__main__":
+    unittest.main()

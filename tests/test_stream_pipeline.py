@@ -158,17 +158,20 @@ def _bare_detector_for_pipeline_test() -> BatchDetector:
     detector._streams_lock = threading.RLock()
     detector._metrics_lock = threading.Lock()
     detector._window_total = 0
+    detector._window_batches = 0
     detector._lifetime_total = 0
     detector._fps = 0.0
     detector._last_fps = time.perf_counter()
-    detector.trackers = {}
-    detector.trails = {}
-    detector.trail_age = {}
-    detector.frame_counts = {}
-    detector._prev_pos = {}
-    detector._prev_vel = {}
-    detector._prev_ts = {}
+    detector._processors = {}
     return detector
+
+
+class _RecordingStream:
+    def __init__(self) -> None:
+        self.processed_frames: list[tuple] = []
+
+    def set_processed_frame(self, frame, *, frame_id: int, captured_at: float) -> None:
+        self.processed_frames.append((frame, frame_id, captured_at))
 
 
 def test_gpu_inference_does_not_wait_for_cpu_post_processing() -> None:
@@ -198,11 +201,13 @@ def test_gpu_inference_does_not_wait_for_cpu_post_processing() -> None:
         fromlist=["ThreadPoolExecutor"],
     ).ThreadPoolExecutor(max_workers=POST_PROCESS_WORKERS)
 
+    streams: dict[str, _RecordingStream] = {}
     items = []
     for index in range(POST_PROCESS_WORKERS):
         camera_id = f"cam-{index}"
-        detector._streams[camera_id] = object()
-        detector._post_inflight.add(camera_id)
+        stream = _RecordingStream()
+        streams[camera_id] = stream
+        detector._streams[camera_id] = stream
         items.append(
             (
                 camera_id,
@@ -223,10 +228,16 @@ def test_gpu_inference_does_not_wait_for_cpu_post_processing() -> None:
     )
     caller.start()
     returned_before_post_processing = inference_returned.wait(timeout=0.5)
+
+    # 后处理被gate卡住期间,推理线程必须已经返回并把原始帧推给WebRTC
+    assert returned_before_post_processing is True
+    for index, stream in enumerate(streams.values()):
+        assert len(stream.processed_frames) == 1
+        assert stream.processed_frames[0][1] == index
+
     post_gate.set()
     caller.join(timeout=2.0)
 
-    assert returned_before_post_processing is True
     assert all_processed.wait(timeout=2.0)
     assert "half" not in model_kwargs
     assert "quantize" not in model_kwargs
@@ -234,7 +245,7 @@ def test_gpu_inference_does_not_wait_for_cpu_post_processing() -> None:
     assert detector._post_inflight == set()
 
 
-def test_batch_event_is_cleared_when_only_inflight_camera_is_pending() -> None:
+def test_inflight_camera_is_not_eligible_for_batching() -> None:
     detector = _bare_detector_for_pipeline_test()
     detector._pending["cam-1"] = PendingFrame(
         np.zeros((4, 4, 3), dtype=np.uint8),
@@ -242,9 +253,26 @@ def test_batch_event_is_cleared_when_only_inflight_camera_is_pending() -> None:
         captured_at=time.perf_counter(),
     )
     detector._post_inflight.add("cam-1")
-    detector._pending_event.set()
+    detector._pending["cam-2"] = PendingFrame(
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        frame_id=2,
+        captured_at=time.perf_counter(),
+    )
 
-    assert detector._take_batch() == []
+    # 仅 inflight 的摄像头不计入可凑批数量,避免同一帧被重复后处理
+    assert detector._eligible_pending_count() == 1
+
+    taken = detector._take_batch()
+    assert [cam_id for cam_id, _ in taken] == ["cam-1", "cam-2"]
+    assert detector._pending_event.is_set() is False
+
+    detector._pending["cam-3"] = PendingFrame(
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        frame_id=3,
+        captured_at=time.perf_counter(),
+    )
+    detector._pending_event.set()
+    detector._take_batch()
     assert detector._pending_event.is_set() is False
 
 

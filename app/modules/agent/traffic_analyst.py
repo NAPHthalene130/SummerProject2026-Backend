@@ -53,6 +53,7 @@ class TrafficAnalyst:
             cls._instance = super().__new__(cls)
             cls._instance._client: Optional[AsyncOpenAI] = None
             cls._instance._prompt: str = ""
+            cls._instance._verification_prompt: str = ""
             cls._instance._task: Optional[asyncio.Task] = None
             cls._instance._camera_tasks: dict[str, asyncio.Task] = {}
             cls._instance._next_analysis: dict[str, float] = {}
